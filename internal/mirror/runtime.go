@@ -143,6 +143,13 @@ func Run(ctx context.Context, args []string) (runErr error) {
 	if err != nil {
 		return err
 	}
+	var itemLog *syncLog
+	if command == "sync" {
+		itemLog, err = openSyncLog(filepath.Join(*dir, "sync.log"))
+		if err != nil {
+			return err
+		}
+	}
 	cache, err := media.New(db, filepath.Join(*dir, "media"))
 	if err != nil {
 		return err
@@ -167,7 +174,7 @@ func Run(ctx context.Context, args []string) (runErr error) {
 		}
 	}()
 	defer func() { abort(context.Canceled); <-mediaDone }()
-	e := &Engine{DB: db, Account: session.Account, Abort: abort, Reconcile: make(chan struct{}, 1)}
+	e := &Engine{DB: db, Log: itemLog, Account: session.Account, Abort: abort, Reconcile: make(chan struct{}, 1)}
 	c := instameow.NewClient(instameow.ClientParams{Cookies: session.Cookies, Log: zerolog.New(os.Stderr).Level(zerolog.Disabled), DisableTyping: true, RawGraphQLResponse: captureGraphQL, RawDeltaResponse: e.captureDeltas, EventHandler: e.event})
 	e.Client = c
 	defer func() {

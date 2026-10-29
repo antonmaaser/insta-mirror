@@ -29,6 +29,7 @@ func captureGraphQL(ctx context.Context, operation string, raw []byte) error {
 
 type Engine struct {
 	DB             *store.Store
+	Log            *syncLog
 	Client         *instameow.Client
 	Account        string
 	Abort          context.CancelCauseFunc
@@ -105,7 +106,7 @@ func (e *Engine) archive(ctx context.Context, raw []byte, spec pageSpec) error {
 		state.Error = "pagination cursor did not advance"
 		state.Gaps = []string{state.Error}
 	}
-	err := e.DB.Transaction(ctx, func(tx *sql.Tx) error {
+	err := e.archiveTransaction(ctx, func(tx *sql.Tx) error {
 		if spec.Messages {
 			if store.Identity("threads", container) != "" && store.String(container, "thread_fbid") != "" {
 				if err := e.thread(ctx, tx, container, spec.Path, now); err != nil {

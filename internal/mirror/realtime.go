@@ -42,7 +42,7 @@ func (e *Engine) captureDeltas(ctx context.Context, b []byte) error {
 		return e.unparsedBatch(ctx, b)
 	}
 	var parseFailure bool
-	err := e.DB.Transaction(ctx, func(tx *sql.Tx) error {
+	err := e.archiveTransaction(ctx, func(tx *sql.Tx) error {
 		now := time.Now().UnixMilli()
 		for wi, w := range wrappers {
 			for di, raw := range w.Data.Deltas {
@@ -215,7 +215,7 @@ func (e *Engine) Follow(ctx context.Context) error {
 
 func (e *Engine) unparsedBatch(ctx context.Context, b []byte) error {
 	raw, _ := json.Marshal(map[string]string{"unparseable_delta_batch": string(b)})
-	err := e.DB.Transaction(ctx, func(tx *sql.Tx) error {
+	err := e.archiveTransaction(ctx, func(tx *sql.Tx) error {
 		if err := store.Put(ctx, tx, store.Record{Table: "deltas", Account: e.Account, Identity: "unparsed:" + store.Hash(b), Origin: "dgw-unparsed", Raw: raw}); err != nil {
 			return err
 		}
