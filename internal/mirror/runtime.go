@@ -18,7 +18,7 @@ import (
 )
 
 func newClient(c *cookies.Cookies) *instameow.Client {
-	return instameow.NewClient(instameow.ClientParams{Cookies: c, Log: zerolog.New(os.Stderr).Level(zerolog.Disabled), DisableTyping: true})
+	return instameow.NewClient(instameow.ClientParams{Cookies: c, Log: zerolog.New(os.Stderr).Level(zerolog.Disabled), DisableTyping: true, RawGraphQLResponse: captureGraphQL})
 }
 func Run(ctx context.Context, args []string) error {
 	if len(args) == 0 || args[0] == "--help" || args[0] == "help" {
@@ -96,5 +96,20 @@ func Run(ctx context.Context, args []string) error {
 			return fmt.Errorf("invalid cached connection state")
 		}
 	}
-	return fmt.Errorf("%s synchronization is not yet available", command)
+	e := &Engine{DB: db, Client: c, Account: session.Account}
+	if err = e.Initialize(ctx); err != nil {
+		return err
+	}
+	session.State, err = c.DumpState()
+	if err != nil {
+		return err
+	}
+	session.Claim = c.GetCookies().GetWWWClaim()
+	if err = vault.Save(session); err != nil {
+		return err
+	}
+	if command == "serve" || *follow {
+		return fmt.Errorf("realtime serving is not yet available")
+	}
+	return e.History(ctx)
 }

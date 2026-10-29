@@ -80,7 +80,8 @@ type Client struct {
 
 	logRedactedLoginResponses bool
 
-	eventHandler EventHandler
+	eventHandler       EventHandler
+	rawGraphQLResponse func(context.Context, string, []byte) error
 
 	seqID   int64
 	seqIDTS time.Time
@@ -94,14 +95,15 @@ type EventHandler func(context.Context, slidetypes.ClientEvent) error
 var _ httpclient.Client = (*Client)(nil)
 
 type ClientParams struct {
-	Cookies       *cookies.Cookies
-	Log           zerolog.Logger
-	Settings      exhttp.ClientSettings
-	SeqID         int64
-	SeqIDTS       time.Time
-	EventHandler  EventHandler
-	DisableTyping bool
-	NativeSession *types.InstagramNativeSession
+	Cookies            *cookies.Cookies
+	Log                zerolog.Logger
+	Settings           exhttp.ClientSettings
+	SeqID              int64
+	SeqIDTS            time.Time
+	EventHandler       EventHandler
+	RawGraphQLResponse func(context.Context, string, []byte) error
+	DisableTyping      bool
+	NativeSession      *types.InstagramNativeSession
 
 	LogRedactedLoginResponses bool
 
@@ -113,12 +115,13 @@ type ClientParams struct {
 
 func NewClient(params ClientParams) *Client {
 	c := &Client{
-		cookies:       params.Cookies,
-		log:           &params.Log,
-		seqID:         params.SeqID,
-		seqIDTS:       params.SeqIDTS,
-		socketStopped: exsync.NewEvent(),
-		connected:     exsync.NewEvent(),
+		cookies:            params.Cookies,
+		log:                &params.Log,
+		seqID:              params.SeqID,
+		seqIDTS:            params.SeqIDTS,
+		rawGraphQLResponse: params.RawGraphQLResponse,
+		socketStopped:      exsync.NewEvent(),
+		connected:          exsync.NewEvent(),
 
 		mqttBypassConnected:     exsync.NewEvent(),
 		streamControllerStopped: exsync.NewEvent(),

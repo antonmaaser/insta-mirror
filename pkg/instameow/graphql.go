@@ -199,6 +199,11 @@ func makeGraphQLRequest[T any](ctx context.Context, c *Client, name string, req 
 		return
 	}
 	var wrappedResp graphql.Response[T]
+	if c.rawGraphQLResponse != nil {
+		if err = c.rawGraphQLResponse(ctx, name, respData); err != nil {
+			return resp, fmt.Errorf("raw GraphQL capture: %w", err)
+		}
+	}
 	err = json.Unmarshal(respData, &wrappedResp)
 	if err != nil {
 		err = fmt.Errorf("failed to unmarshal %T: %w", resp, err)
