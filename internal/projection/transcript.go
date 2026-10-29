@@ -55,25 +55,57 @@ func WriteTranscript(ctx context.Context, db *store.Store, chat store.Record, w 
 	if decodeErr != nil {
 		fmt.Fprintln(&header, "Thread interpretation is partial; the source record remains available.")
 	}
-	fmt.Fprint(&header, "\nThis is the local archive at one read snapshot, not a claim of complete Instagram history.\nMessages use source timestamps; ties use local record order. Missing timestamps are listed last.\nNames come from the retained thread observation. Updates are applied only where source ordering is established.\n")
+	fmt.Fprint(&header, "\nThis is the local archive at one read snapshot, not a claim of complete Instagram history.\nMessages use source timestamps; ties use local record order. Missing timestamps are listed last.\nReaction events are grouped beneath their source-linked message, regardless of reaction time.\nNames come from the retained thread observation. Updates are applied only where source ordering is established.\n")
 	if _, err := io.WriteString(w, header.String()); err != nil {
 		return err
 	}
+	attached, unresolved, err := reactionLogs(ctx, db, chat)
+	if err != nil {
+		return err
+	}
 	count := 0
-	err := db.TranscriptMessages(ctx, chat.Account, chat.Identity, func(record store.Record) error {
+	err = db.TranscriptMessages(ctx, chat.Account, chat.Identity, func(record store.Record) error {
 		if err := ctx.Err(); err != nil {
 			return err
+		}
+		if isReactionLog(record.Raw) {
+			return nil
 		}
 		projected, err := Build(ctx, db, record, true)
 		if err != nil {
 			return err
 		}
-		_, err = io.WriteString(w, transcriptMessage(projected, names))
+		if _, err = io.WriteString(w, transcriptMessage(projected, names)); err != nil {
+			return err
+		}
+		for _, reaction := range attached[record.Identity] {
+			result, err := Build(ctx, db, reaction, true)
+			if err != nil {
+				return err
+			}
+			if _, err = io.WriteString(w, "  Reaction event attached by source log_message_id:\n"+transcriptMessage(result, names)); err != nil {
+				return err
+			}
+		}
 		count++
-		return err
+		return nil
 	})
 	if err != nil {
 		return err
+	}
+	if len(unresolved) > 0 {
+		if _, err = io.WriteString(w, "Unresolved reaction events (source target unavailable or ambiguous):\n"); err != nil {
+			return err
+		}
+		for _, record := range unresolved {
+			result, err := Build(ctx, db, record, true)
+			if err != nil {
+				return err
+			}
+			if _, err = io.WriteString(w, transcriptMessage(result, names)); err != nil {
+				return err
+			}
+		}
 	}
 	_, err = fmt.Fprintf(w, "Messages exported: %d\n", count)
 	return err

@@ -19,12 +19,16 @@ import (
 )
 
 func runCommand(ctx context.Context, args []string, defaultDir string) error {
-	if len(args) == 0 || args[0] == "help" || args[0] == "--help" {
-		fmt.Fprintln(os.Stdout, "igdm-mirror cmd {chats|export} [--data-dir DIR | --db FILE] [--account ID]\n  chats:  [--limit 30] [--cursor CURSOR]\n  export: --chat id:SOURCE_ID --output FILE")
+	if len(args) > 0 && (args[0] == "help" || args[0] == "--help") {
+		fmt.Fprintln(os.Stdout, "igdm-mirror cmd [--data-dir DIR | --db FILE] [--account ID] [--export-dir DIR]\n  Interactive: ↑/↓ select, → inspect, ← chats, e export, q/Esc quit\n  Direct: cmd chats [--limit 30] [--cursor CURSOR]\n          cmd export --chat id:SOURCE_ID --output FILE")
 		return nil
 	}
-	action := args[0]
-	if action != "chats" && action != "export" {
+	action := "ui"
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		action = args[0]
+		args = args[1:]
+	}
+	if action != "ui" && action != "chats" && action != "export" {
 		return fmt.Errorf("unknown cmd action %q", action)
 	}
 	fs := flag.NewFlagSet("cmd "+action, flag.ContinueOnError)
@@ -33,14 +37,17 @@ func runCommand(ctx context.Context, args []string, defaultDir string) error {
 	account := fs.String("account", "", "numeric source account ID; inferred only if exactly one is archived")
 	var chat, output, cursor string
 	var limit int
-	if action == "chats" {
+	exportDir := ""
+	if action == "ui" {
+		fs.StringVar(&exportDir, "export-dir", "", "transcript directory; defaults to exports/ beside the database")
+	} else if action == "chats" {
 		fs.IntVar(&limit, "limit", 30, "maximum chats, 1 through 100")
 		fs.StringVar(&cursor, "cursor", "", "next cursor from a previous listing")
 	} else {
 		fs.StringVar(&chat, "chat", "", "namespaced source reference from cmd chats")
 		fs.StringVar(&output, "output", "", "new transcript file; existing files are never replaced")
 	}
-	if err := fs.Parse(args[1:]); err != nil {
+	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil
 		}
@@ -66,7 +73,7 @@ func runCommand(ctx context.Context, args []string, defaultDir string) error {
 		return err
 	}
 	defer db.Close()
-	return db.ReadSnapshot(ctx, func(snapshot *store.Store) error {
+	err = db.ReadSnapshot(ctx, func(snapshot *store.Store) error {
 		accounts, err := snapshot.Accounts(ctx)
 		if err != nil {
 			return err
@@ -90,17 +97,34 @@ func runCommand(ctx context.Context, args []string, defaultDir string) error {
 		if !found {
 			return errors.New("account is not present in the mirror database")
 		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if action == "ui" {
+		if exportDir == "" {
+			exportDir = filepath.Join(filepath.Dir(*path), "exports")
+		}
+		return runTerminal(ctx, db, *path, *account, exportDir)
+	}
+	return db.ReadSnapshot(ctx, func(snapshot *store.Store) error {
 		if action == "chats" {
 			return inspectChats(ctx, snapshot, *account, cursor, limit)
 		}
-		page, err := snapshot.Query(ctx, "threads", store.Query{Account: *account, SourceID: chat, Limit: 2})
+		chatRecord, err := selectedChat(ctx, snapshot, *account, chat)
 		if err != nil {
 			return err
 		}
-		if len(page.Records) != 1 {
-			return errors.New("chat reference is unavailable or ambiguous; use a source reference from cmd chats")
+		if err = exportTranscript(ctx, snapshot, *path, chatRecord, output); err != nil {
+			return err
 		}
-		return exportTranscript(ctx, snapshot, *path, page.Records[0], output)
+		target, err := filepath.Abs(output)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(os.Stdout, "Transcript exported: %s\n", target)
+		return nil
 	})
 }
 func inspectChats(ctx context.Context, db *store.Store, account, cursor string, limit int) error {
@@ -198,6 +222,16 @@ func exportTranscript(ctx context.Context, db *store.Store, dbPath string, chat 
 	if err = os.Link(f.Name(), target); err != nil {
 		return fmt.Errorf("publish transcript without replacing existing files: %w", err)
 	}
-	fmt.Fprintf(os.Stdout, "Transcript exported: %s\n", target)
 	return nil
+}
+
+func selectedChat(ctx context.Context, db *store.Store, account, identity string) (store.Record, error) {
+	page, err := db.Query(ctx, "threads", store.Query{Account: account, SourceID: identity, Limit: 2})
+	if err != nil {
+		return store.Record{}, err
+	}
+	if len(page.Records) != 1 {
+		return store.Record{}, errors.New("chat reference is unavailable or ambiguous; use a source reference from cmd chats")
+	}
+	return page.Records[0], nil
 }
