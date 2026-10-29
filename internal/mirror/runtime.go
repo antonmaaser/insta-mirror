@@ -11,6 +11,7 @@ import (
 
 	"github.com/rs/zerolog"
 	"go.mau.fi/mautrix-meta/internal/auth"
+	"go.mau.fi/mautrix-meta/internal/mcp"
 	"go.mau.fi/mautrix-meta/internal/store"
 	"go.mau.fi/mautrix-meta/pkg/instameow"
 	"go.mau.fi/mautrix-meta/pkg/messagix/cookies"
@@ -44,6 +45,9 @@ func Run(ctx context.Context, args []string) error {
 	imported := fs.Bool("cookies", false, "import cookies interactively instead of password login")
 	once := fs.Bool("once", false, "finish pending historical work and exit")
 	follow := fs.Bool("follow", false, "maintain realtime synchronization")
+	httpAddress := fs.String("http", "", "optional MCP HTTP listen address, e.g. 127.0.0.1:8080")
+	httpToken := fs.String("http-token-file", "", "owner-only MCP bearer token file")
+	allowNetwork := fs.Bool("allow-network", false, "allow explicit HTTP network exposure")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
@@ -105,10 +109,32 @@ func Run(ctx context.Context, args []string) error {
 			return fmt.Errorf("invalid cached connection state")
 		}
 	}
+	if command == "serve" {
+		done := make(chan error, 1)
+		go func() {
+			syncErr := e.Initialize(workCtx)
+			if syncErr == nil {
+				syncErr = e.PrepareRealtime(workCtx)
+			}
+			if syncErr == nil {
+				syncErr = e.Follow(workCtx)
+			}
+			if syncErr != nil && workCtx.Err() == nil {
+				_ = db.SetState(ctx, session.Account, "reconciliation", "runtime", store.State{Error: "synchronization stopped; inspect coverage and authentication"})
+				fmt.Fprintln(os.Stderr, "synchronization stopped; inspect status")
+			}
+			done <- syncErr
+		}()
+		serveErr := mcp.New(db, session.Account).Run(ctx, *httpAddress, *httpToken, *allowNetwork)
+		abort(context.Canceled)
+		c.Disconnect()
+		<-done
+		return serveErr
+	}
 	if err = e.Initialize(workCtx); err != nil {
 		return err
 	}
-	if command == "serve" || *follow {
+	if *follow {
 		if err = e.PrepareRealtime(workCtx); err != nil {
 			return err
 		}

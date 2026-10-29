@@ -66,7 +66,7 @@ func (e *Engine) captureDeltas(ctx context.Context, b []byte) error {
 				msg := field(raw, "message")
 				if object(msg) && store.Identity("messages", msg) != "" {
 					// All nested source bytes are retained even if their typed decoding fails.
-					if err := e.message(ctx, tx, msg, store.String(raw, "thread_fbid"), "dgw", now); err != nil {
+					if err := e.message(ctx, tx, msg, store.String(raw, "thread_fbid"), fmt.Sprintf("dgw:%d", delta.UQSeqID), now); err != nil {
 						return err
 					}
 				}
