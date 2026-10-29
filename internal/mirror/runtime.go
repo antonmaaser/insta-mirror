@@ -89,27 +89,30 @@ func Run(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	c := newClient(session.Cookies)
+	workCtx, abort := context.WithCancelCause(ctx)
+	defer abort(context.Canceled)
+	e := &Engine{DB: db, Account: session.Account, Abort: abort, Reconcile: make(chan struct{}, 1)}
+	c := instameow.NewClient(instameow.ClientParams{Cookies: session.Cookies, Log: zerolog.New(os.Stderr).Level(zerolog.Disabled), DisableTyping: true, RawGraphQLResponse: captureGraphQL, RawDeltaResponse: e.captureDeltas, EventHandler: e.event})
+	e.Client = c
 	defer c.Disconnect()
+	e.SaveConnection = func(state json.RawMessage) error {
+		session.State = state
+		session.Claim = session.Cookies.GetWWWClaim()
+		return vault.Save(session)
+	}
 	if len(session.State) > 0 {
 		if err = c.LoadState(session.State); err != nil && err != instameow.ErrCachedStateTooOld {
 			return fmt.Errorf("invalid cached connection state")
 		}
 	}
-	e := &Engine{DB: db, Client: c, Account: session.Account}
-	if err = e.Initialize(ctx); err != nil {
-		return err
-	}
-	session.State, err = c.DumpState()
-	if err != nil {
-		return err
-	}
-	session.Claim = c.GetCookies().GetWWWClaim()
-	if err = vault.Save(session); err != nil {
+	if err = e.Initialize(workCtx); err != nil {
 		return err
 	}
 	if command == "serve" || *follow {
-		return fmt.Errorf("realtime serving is not yet available")
+		if err = e.PrepareRealtime(workCtx); err != nil {
+			return err
+		}
+		return e.Follow(workCtx)
 	}
-	return e.History(ctx)
+	return e.History(workCtx)
 }

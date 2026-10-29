@@ -330,6 +330,11 @@ func (c *Client) handleOperation(ctx context.Context, rawOp *mdCoreSync.Operatio
 		c.log.Info().Any("resnapshot_payload", op.Resnapshot).Msg("Received resnapshot operation")
 		return fmt.Errorf("%w (%d): %s", errResnapshotRequired, op.Resnapshot.GetErrorType(), op.Resnapshot.GetErrorMessage())
 	case *mdCoreSync.Operation_Delta:
+		if c.rawDeltaResponse != nil {
+			if err := c.rawDeltaResponse(ctx, []byte(op.Delta.GetDelta())); err != nil {
+				return fmt.Errorf("raw delta capture: %w", err)
+			}
+		}
 		var deltaWrappers []*slidetypes.DeltaWrapper
 		err := json.Unmarshal(exstrings.UnsafeBytes(op.Delta.GetDelta()), &deltaWrappers)
 		if err != nil {

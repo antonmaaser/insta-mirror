@@ -82,6 +82,7 @@ type Client struct {
 
 	eventHandler       EventHandler
 	rawGraphQLResponse func(context.Context, string, []byte) error
+	rawDeltaResponse   func(context.Context, []byte) error
 
 	seqID   int64
 	seqIDTS time.Time
@@ -102,6 +103,7 @@ type ClientParams struct {
 	SeqIDTS            time.Time
 	EventHandler       EventHandler
 	RawGraphQLResponse func(context.Context, string, []byte) error
+	RawDeltaResponse   func(context.Context, []byte) error
 	DisableTyping      bool
 	NativeSession      *types.InstagramNativeSession
 
@@ -120,6 +122,7 @@ func NewClient(params ClientParams) *Client {
 		seqID:              params.SeqID,
 		seqIDTS:            params.SeqIDTS,
 		rawGraphQLResponse: params.RawGraphQLResponse,
+		rawDeltaResponse:   params.RawDeltaResponse,
 		socketStopped:      exsync.NewEvent(),
 		connected:          exsync.NewEvent(),
 

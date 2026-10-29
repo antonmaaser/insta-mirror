@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"net"
+	"strconv"
 	"time"
 
 	"go.mau.fi/mautrix-meta/internal/store"
@@ -27,9 +28,12 @@ func captureGraphQL(ctx context.Context, operation string, raw []byte) error {
 }
 
 type Engine struct {
-	DB      *store.Store
-	Client  *instameow.Client
-	Account string
+	DB             *store.Store
+	Client         *instameow.Client
+	Account        string
+	Abort          context.CancelCauseFunc
+	Reconcile      chan struct{}
+	SaveConnection func(json.RawMessage) error
 }
 type pageSpec struct {
 	Scope, ID, Path, Previous string
@@ -122,6 +126,29 @@ func (e *Engine) archive(ctx context.Context, raw []byte, spec pageSpec) error {
 							return err
 						}
 					}
+				}
+			}
+		}
+		if spec.Path == "get_slide_mailbox_for_iris_subscription" {
+			var checkpoint store.State
+			// Read through the transaction; Store.DB has a single connection.
+			var prior string
+			err := tx.QueryRowContext(ctx, `SELECT state FROM sync_state WHERE account_id=? AND scope='realtime' AND scope_id='checkpoint'`, e.Account).Scan(&prior)
+			if err != nil && !errors.Is(err, sql.ErrNoRows) {
+				return err
+			}
+			if prior != "" {
+				if err = json.Unmarshal([]byte(prior), &checkpoint); err != nil {
+					return err
+				}
+			}
+			if checkpoint.SeqID == 0 {
+				seq, err := strconv.ParseInt(store.String(source, "iris_inactive_subscription_uq_seq_id"), 10, 64)
+				if err != nil || seq <= 0 {
+					return errors.New("mailbox has no valid subscription sequence")
+				}
+				if err = store.SaveState(ctx, tx, e.Account, "realtime", "checkpoint", store.State{SeqID: seq, Timestamp: now, LastSuccess: now, Gaps: []string{"initial snapshot baseline; older realtime events were not acquired"}}); err != nil {
+					return err
 				}
 			}
 		}
