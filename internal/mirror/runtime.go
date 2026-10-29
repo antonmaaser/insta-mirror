@@ -26,12 +26,12 @@ func newClient(c *cookies.Cookies) *instameow.Client {
 }
 func Run(ctx context.Context, args []string) (runErr error) {
 	if len(args) == 0 || args[0] == "--help" || args[0] == "help" {
-		fmt.Fprintln(os.Stdout, "igdm-mirror {setup|login|sync --once|sync --follow|serve|status} [--data-dir DIR] [--account ID] [--secret-file FILE]")
+		fmt.Fprintln(os.Stdout, "igdm-mirror {setup|login|sync --once|sync --follow|serve|status|cmd} [--data-dir DIR] [--account ID] [--secret-file FILE]")
 		fmt.Fprintln(os.Stdout, "Run setup before login. Defaults: data/ and session.key beside the executable; override with IGDM_DATA_DIR and IGDM_SECRET_FILE.")
 		return nil
 	}
 	command := args[0]
-	if command != "setup" && command != "login" && command != "sync" && command != "serve" && command != "status" {
+	if command != "cmd" && command != "setup" && command != "login" && command != "sync" && command != "serve" && command != "status" {
 		return fmt.Errorf("unknown command %q", command)
 	}
 	fs := flag.NewFlagSet(command, flag.ContinueOnError)
@@ -53,6 +53,9 @@ func Run(ctx context.Context, args []string) (runErr error) {
 		if defaultSecret == "" {
 			defaultSecret = filepath.Join(base, "session.key")
 		}
+	}
+	if command == "cmd" {
+		return runCommand(ctx, args[1:], defaultDir)
 	}
 	dir := fs.String("data-dir", defaultDir, "private data directory")
 	account := fs.String("account", "", "numeric Instagram account ID")

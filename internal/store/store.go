@@ -16,7 +16,10 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-type Store struct{ DB *sql.DB }
+type Store struct {
+	DB     *sql.DB
+	readTx *sql.Tx
+}
 
 type Record struct {
 	Table        string          `json:"kind"`
@@ -188,7 +191,7 @@ func SaveState(ctx context.Context, tx *sql.Tx, account, scope, id string, state
 }
 func (s *Store) State(ctx context.Context, account, scope, id string, out any) error {
 	var b string
-	err := s.DB.QueryRowContext(ctx, `SELECT state FROM sync_state WHERE account_id=? AND scope=? AND scope_id=?`, account, scope, id).Scan(&b)
+	err := s.queryRowContext(ctx, `SELECT state FROM sync_state WHERE account_id=? AND scope=? AND scope_id=?`, account, scope, id).Scan(&b)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil
 	}
@@ -212,7 +215,7 @@ func (s *Store) SetState(ctx context.Context, account, scope, id string, value a
 	return s.Transaction(ctx, func(tx *sql.Tx) error { return SaveState(ctx, tx, account, scope, id, value) })
 }
 func (s *Store) Status(ctx context.Context, account string) ([]map[string]any, error) {
-	rows, err := s.DB.QueryContext(ctx, `SELECT account_id,scope,scope_id,state FROM sync_state WHERE (?='' OR account_id=?) ORDER BY account_id,scope,scope_id`, account, account)
+	rows, err := s.queryContext(ctx, `SELECT account_id,scope,scope_id,state FROM sync_state WHERE (?='' OR account_id=?) ORDER BY account_id,scope,scope_id`, account, account)
 	if err != nil {
 		return nil, err
 	}

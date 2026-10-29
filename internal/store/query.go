@@ -51,21 +51,24 @@ func (s *Store) ThreadReferences(ctx context.Context, account, ref string) ([]st
 	if err != nil {
 		return nil, err
 	}
-	rows, err := s.DB.QueryContext(ctx, `SELECT DISTINCT id,thread_fbid FROM threads WHERE account_id=? AND `+col+`=?`, account, value)
+	rows, err := s.queryContext(ctx, `SELECT DISTINCT id,thread_fbid FROM threads WHERE account_id=? AND `+col+`=?`, account, value)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	var out []string
+	seen := map[string]bool{}
 	for rows.Next() {
 		var id, fbid sql.NullString
 		if err = rows.Scan(&id, &fbid); err != nil {
 			return nil, err
 		}
-		if id.String != "" {
+		if id.String != "" && !seen[id.String] {
+			seen[id.String] = true
 			out = append(out, id.String)
 		}
-		if fbid.String != "" {
+		if fbid.String != "" && !seen[fbid.String] {
+			seen[fbid.String] = true
 			out = append(out, fbid.String)
 		}
 	}
@@ -103,7 +106,7 @@ func (s *Store) Query(ctx context.Context, table string, q Query) (Page, error) 
 			return out, errors.New("invalid cursor for these filters")
 		}
 	} else {
-		if err := s.DB.QueryRowContext(ctx, `SELECT coalesce(max(record_id),0) FROM `+table+` WHERE account_id=?`, q.Account).Scan(&pos.Top); err != nil {
+		if err := s.queryRowContext(ctx, `SELECT coalesce(max(record_id),0) FROM `+table+` WHERE account_id=?`, q.Account).Scan(&pos.Top); err != nil {
 			return out, err
 		}
 		pos.Before = pos.Top + 1
@@ -174,7 +177,7 @@ func (s *Store) Query(ctx context.Context, table string, q Query) (Page, error) 
 	sqlText := `WITH ranked AS (SELECT *,row_number() OVER(PARTITION BY source_identity ORDER BY ` + rankOrder + `) AS rank FROM ` + table + ` WHERE ` + where + `) SELECT record_id,account_id,source_identity,acquired_thread_id,origin,observed_at_ms,last_observed_at_ms,source_hash,raw FROM ranked WHERE ` + rankFilter + ` AND ` + outer + ` ORDER BY record_id DESC LIMIT ?`
 	args = append(args, outerArgs...)
 	args = append(args, q.Limit+1)
-	rows, err := s.DB.QueryContext(ctx, sqlText, args...)
+	rows, err := s.queryContext(ctx, sqlText, args...)
 	if err != nil {
 		return out, err
 	}
@@ -219,7 +222,7 @@ func (s *Store) Deltas(ctx context.Context, account string, threads []string, me
 		// Thread deletion changes message availability as well.
 		where += ` AND ((` + strings.Join(cond, " OR ") + `) OR __typename='SlideUQPPDeleteThread')`
 	}
-	rows, err := s.DB.QueryContext(ctx, `SELECT record_id,source_identity,origin,observed_at_ms,last_observed_at_ms,source_hash,raw FROM deltas WHERE `+where+` ORDER BY CAST(uq_seq_id AS INTEGER),record_id LIMIT 201`, args...)
+	rows, err := s.queryContext(ctx, `SELECT record_id,source_identity,origin,observed_at_ms,last_observed_at_ms,source_hash,raw FROM deltas WHERE `+where+` ORDER BY CAST(uq_seq_id AS INTEGER),record_id LIMIT 201`, args...)
 	if err != nil {
 		return nil, false, err
 	}
@@ -250,7 +253,7 @@ func (s *Store) Record(ctx context.Context, account, table string, id int64) (Re
 		return r, errors.New("invalid source kind")
 	}
 	var raw string
-	err := s.DB.QueryRowContext(ctx, `SELECT record_id,source_identity,acquired_thread_id,origin,observed_at_ms,last_observed_at_ms,source_hash,raw FROM `+table+` WHERE account_id=? AND record_id=?`, account, id).Scan(&r.RowID, &r.Identity, &r.Thread, &r.Origin, &r.Observed, &r.LastObserved, &r.Hash, &raw)
+	err := s.queryRowContext(ctx, `SELECT record_id,source_identity,acquired_thread_id,origin,observed_at_ms,last_observed_at_ms,source_hash,raw FROM `+table+` WHERE account_id=? AND record_id=?`, account, id).Scan(&r.RowID, &r.Identity, &r.Thread, &r.Origin, &r.Observed, &r.LastObserved, &r.Hash, &raw)
 	r.Raw = json.RawMessage(raw)
 	return r, err
 }

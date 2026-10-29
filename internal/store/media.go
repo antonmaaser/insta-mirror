@@ -35,7 +35,7 @@ func mediaScan(row interface{ Scan(...any) error }) (Media, error) {
 	return m, err
 }
 func (s *Store) Media(ctx context.Context, account string, record int64) ([]Media, error) {
-	rows, err := s.DB.QueryContext(ctx, `SELECT * FROM media_cache WHERE account_id=? AND message_record_id=? ORDER BY attachment_reference`, account, record)
+	rows, err := s.queryContext(ctx, `SELECT * FROM media_cache WHERE account_id=? AND message_record_id=? ORDER BY attachment_reference`, account, record)
 	if err != nil {
 		return nil, err
 	}
@@ -54,13 +54,13 @@ func (s *Store) Media(ctx context.Context, account string, record int64) ([]Medi
 	return out, rows.Err()
 }
 func (s *Store) CachedMedia(ctx context.Context, account, ref, urlHash string) (Media, error) {
-	return mediaScan(s.DB.QueryRowContext(ctx, `SELECT * FROM media_cache WHERE account_id=? AND attachment_reference=? AND url_hash=? AND status='available' LIMIT 1`, account, ref, urlHash))
+	return mediaScan(s.queryRowContext(ctx, `SELECT * FROM media_cache WHERE account_id=? AND attachment_reference=? AND url_hash=? AND status='available' LIMIT 1`, account, ref, urlHash))
 }
 func (s *Store) MediaHash(ctx context.Context, account, hash string) (Media, error) {
-	return mediaScan(s.DB.QueryRowContext(ctx, `SELECT * FROM media_cache WHERE account_id=? AND content_hash=? AND status='available' LIMIT 1`, account, hash))
+	return mediaScan(s.queryRowContext(ctx, `SELECT * FROM media_cache WHERE account_id=? AND content_hash=? AND status='available' LIMIT 1`, account, hash))
 }
 func (s *Store) MessageBatch(ctx context.Context, account string, after int64) ([]Record, error) {
-	rows, err := s.DB.QueryContext(ctx, `SELECT record_id,raw FROM messages WHERE account_id=? AND record_id>? ORDER BY record_id LIMIT 100`, account, after)
+	rows, err := s.queryContext(ctx, `SELECT record_id,raw FROM messages WHERE account_id=? AND record_id>? ORDER BY record_id LIMIT 100`, account, after)
 	if err != nil {
 		return nil, err
 	}
