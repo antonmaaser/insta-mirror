@@ -19,19 +19,27 @@ func (e *Engine) captureDeltas(ctx context.Context, b []byte) error {
 			Deltas []json.RawMessage `json:"slide_delta_processor"`
 		} `json:"data"`
 	}
-	if err := json.Unmarshal(b, &wrappers); err != nil {
-		raw, _ := json.Marshal(map[string]string{"unparseable_delta_batch": string(b)})
-		err = e.DB.Transaction(ctx, func(tx *sql.Tx) error {
-			if err := store.Put(ctx, tx, store.Record{Table: "deltas", Account: e.Account, Identity: "unparsed:" + store.Hash(b), Origin: "dgw-unparsed", Raw: raw}); err != nil {
-				return err
+	var rawWrappers []json.RawMessage
+	malformed := json.Unmarshal(b, &wrappers) != nil || json.Unmarshal(b, &rawWrappers) != nil
+	if !malformed {
+		for _, rawWrapper := range rawWrappers {
+			if !object(field(rawWrapper, "data", "slide_delta_processor")) {
+				malformed = true
+				break
 			}
-			return store.SaveState(ctx, tx, e.Account, "realtime", "gap", store.State{Error: "unparseable realtime batch; source bytes retained, checkpoint unchanged"})
-		})
-		if err == nil {
-			err = errors.New("unparseable realtime batch; synchronization stopped with a recoverable gap")
 		}
-		e.fail(err)
-		return err
+		for _, wrapper := range wrappers {
+			for _, raw := range wrapper.Data.Deltas {
+				var obj map[string]json.RawMessage
+				if json.Unmarshal(raw, &obj) != nil || obj == nil {
+					malformed = true
+					break
+				}
+			}
+		}
+	}
+	if malformed {
+		return e.unparsedBatch(ctx, b)
 	}
 	var parseFailure bool
 	err := e.DB.Transaction(ctx, func(tx *sql.Tx) error {
@@ -120,7 +128,17 @@ func (e *Engine) event(ctx context.Context, event slidetypes.ClientEvent) error 
 		err = e.DB.SetState(ctx, e.Account, "account", "auth", store.State{Error: "Instagram authentication requires attention; run login"})
 		e.fail(errors.New("Instagram authentication requires attention; run login"))
 	case *slidetypes.ResnapshotRequired:
-		err = e.DB.SetState(ctx, e.Account, "realtime", "resnapshot", store.State{Gaps: []string{"source requested resnapshot; reconciling retained history"}})
+		var prior store.State
+		err = e.DB.State(ctx, e.Account, "realtime", "checkpoint", &prior)
+		if err == nil {
+			err = e.DB.Transaction(ctx, func(tx *sql.Tx) error {
+				gap := store.State{SeqID: prior.SeqID, Timestamp: time.Now().UnixMilli(), Gaps: []string{"source requested resnapshot; intervening realtime deltas may be unavailable; snapshots are reconciled separately"}}
+				if err := store.SaveState(ctx, tx, e.Account, "reconciliation", fmt.Sprintf("resnapshot:%d", gap.Timestamp), gap); err != nil {
+					return err
+				}
+				return store.SaveState(ctx, tx, e.Account, "realtime", "resnapshot", gap)
+			})
+		}
 	}
 	if err != nil {
 		e.fail(err)
@@ -193,4 +211,19 @@ func (e *Engine) Follow(ctx context.Context) error {
 		return cause
 	}
 	return ctx.Err()
+}
+
+func (e *Engine) unparsedBatch(ctx context.Context, b []byte) error {
+	raw, _ := json.Marshal(map[string]string{"unparseable_delta_batch": string(b)})
+	err := e.DB.Transaction(ctx, func(tx *sql.Tx) error {
+		if err := store.Put(ctx, tx, store.Record{Table: "deltas", Account: e.Account, Identity: "unparsed:" + store.Hash(b), Origin: "dgw-unparsed", Raw: raw}); err != nil {
+			return err
+		}
+		return store.SaveState(ctx, tx, e.Account, "realtime", "gap", store.State{Error: "unparseable realtime batch; original bytes retained, checkpoint unchanged"})
+	})
+	if err == nil {
+		err = errors.New("unparseable realtime batch; synchronization stopped with a recoverable gap")
+	}
+	e.fail(err)
+	return err
 }

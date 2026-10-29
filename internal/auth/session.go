@@ -19,6 +19,7 @@ import (
 	"go.mau.fi/mautrix-meta/pkg/messagix/types"
 	"golang.org/x/crypto/scrypt"
 	"golang.org/x/term"
+	"maunium.net/go/mautrix/bridgev2"
 )
 
 var accountPattern = regexp.MustCompile(`^[0-9]+$`)
@@ -228,17 +229,35 @@ func Login(ctx context.Context, client *instameow.Client, importCookies bool) (*
 			return nil, err
 		}
 		challenge, err := client.CreateInstagramWebSession(ctx, username, password)
+		if errors.Is(err, instameow.ErrInstagramWebCookieConsentRequired) {
+			challenge, err = client.ContinueInstagramWebSessionAfterCookieConsent(ctx, username, password)
+		}
 		password = ""
 		if err != nil {
 			return nil, errors.New("Instagram web login failed; complete any challenge in Instagram or use --cookies")
 		}
 		if challenge != nil {
-			code, err := Prompt("Instagram verification code", true)
-			if err != nil {
-				return nil, err
-			}
-			if err = client.CompleteInstagramWebSessionTwoFactor(ctx, code); err != nil {
-				return nil, errors.New("Instagram verification failed; complete the challenge in Instagram or use --cookies")
+			if challenge.AuthPlatform {
+				if err = authPlatform(ctx, client); err != nil {
+					return nil, err
+				}
+			} else {
+				for attempt := 0; attempt < 3; attempt++ {
+					code, promptErr := Prompt("Instagram verification code", true)
+					if promptErr != nil {
+						return nil, promptErr
+					}
+					err = client.CompleteInstagramWebSessionTwoFactor(ctx, code)
+					if err == nil {
+						break
+					}
+					if !errors.Is(err, instameow.ErrInstagramWebTwoFactorCodeRejected) {
+						break
+					}
+				}
+				if err != nil {
+					return nil, errors.New("Instagram verification failed; complete the challenge in Instagram or use --cookies")
+				}
 			}
 		}
 	}
@@ -257,4 +276,57 @@ func Login(ctx context.Context, client *instameow.Client, importCookies bool) (*
 		return nil, err
 	}
 	return &Session{Account: account, Cookies: client.GetCookies(), State: state, Claim: client.GetCookies().GetWWWClaim()}, nil
+}
+
+func authPlatform(ctx context.Context, client *instameow.Client) error {
+	step, err := client.DoInstagramWebAuthPlatformSteps(ctx, nil)
+	for count := 0; step != nil && err == nil && count < 12; count++ {
+		input := map[string]string{}
+		switch step.Type {
+		case bridgev2.LoginStepTypeDisplayAndWait:
+			label := "Approve this login in the Instagram app, then press Enter"
+			if step.DisplayAndWaitParams != nil && step.DisplayAndWaitParams.Type == bridgev2.LoginDisplayTypeCode {
+				label = "Approve this login in Instagram with code " + step.DisplayAndWaitParams.Data + ", then press Enter"
+			}
+			if _, err = Prompt(label, false); err != nil {
+				return err
+			}
+		case bridgev2.LoginStepTypeUserInput:
+			if step.UserInputParams == nil || len(step.UserInputParams.Attachments) > 0 {
+				return errors.New("Instagram requires an interactive browser challenge; complete it in Instagram and use --cookies")
+			}
+			for _, field := range step.UserInputParams.Fields {
+				if field.ID != "method" && field.ID != "action" && field.ID != "verification_code" {
+					return errors.New("unsupported Instagram challenge; complete it in Instagram and use --cookies")
+				}
+				label := field.Name
+				if len(field.Options) > 0 {
+					label += " (" + strings.Join(field.Options, " | ") + ")"
+				}
+				value, promptErr := Prompt(label, field.ID == "verification_code")
+				if promptErr != nil {
+					return promptErr
+				}
+				if len(field.Options) > 0 {
+					found := false
+					for _, option := range field.Options {
+						if value == option {
+							found = true
+						}
+					}
+					if !found {
+						return errors.New("select an exact verification method offered by Instagram")
+					}
+				}
+				input[field.ID] = value
+			}
+		default:
+			return errors.New("unsupported Instagram challenge; complete it in Instagram and use --cookies")
+		}
+		step, err = client.DoInstagramWebAuthPlatformSteps(ctx, input)
+	}
+	if err != nil || step != nil {
+		return errors.New("Instagram challenge did not complete; complete it in Instagram and use --cookies")
+	}
+	return nil
 }

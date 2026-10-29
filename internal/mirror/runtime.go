@@ -3,10 +3,12 @@ package mirror
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -22,7 +24,7 @@ import (
 func newClient(c *cookies.Cookies) *instameow.Client {
 	return instameow.NewClient(instameow.ClientParams{Cookies: c, Log: zerolog.New(os.Stderr).Level(zerolog.Disabled), DisableTyping: true, RawGraphQLResponse: captureGraphQL})
 }
-func Run(ctx context.Context, args []string) error {
+func Run(ctx context.Context, args []string) (runErr error) {
 	if len(args) == 0 || args[0] == "--help" || args[0] == "help" {
 		fmt.Fprintln(os.Stdout, "igdm-mirror {login|sync --once|sync --follow|serve|status} [--data-dir DIR] [--account ID] [--secret-file FILE]")
 		return nil
@@ -90,6 +92,23 @@ func Run(ctx context.Context, args []string) error {
 		}
 		return json.NewEncoder(os.Stdout).Encode(map[string]any{"account_id": session.Account, "session_saved": true})
 	}
+	if *account == "" {
+		files, err := filepath.Glob(filepath.Join(*dir, "sessions", "*.enc"))
+		if err != nil {
+			return err
+		}
+		var ids []string
+		for _, file := range files {
+			id := strings.TrimSuffix(filepath.Base(file), ".enc")
+			if auth.ValidAccount(id) {
+				ids = append(ids, id)
+			}
+		}
+		if len(ids) != 1 {
+			return fmt.Errorf("select an account with --account; found %d saved sessions", len(ids))
+		}
+		*account = ids[0]
+	}
 	session, err := vault.Load(*account)
 	if err != nil {
 		return err
@@ -121,14 +140,25 @@ func Run(ctx context.Context, args []string) error {
 	e := &Engine{DB: db, Account: session.Account, Abort: abort, Reconcile: make(chan struct{}, 1)}
 	c := instameow.NewClient(instameow.ClientParams{Cookies: session.Cookies, Log: zerolog.New(os.Stderr).Level(zerolog.Disabled), DisableTyping: true, RawGraphQLResponse: captureGraphQL, RawDeltaResponse: e.captureDeltas, EventHandler: e.event})
 	e.Client = c
-	defer c.Disconnect()
+	defer func() {
+		c.Disconnect()
+		state, err := c.DumpState()
+		if err == nil {
+			session.State = state
+			session.Claim = session.Cookies.GetWWWClaim()
+			err = vault.Save(session)
+		}
+		if runErr == nil && err != nil {
+			runErr = err
+		}
+	}()
 	e.SaveConnection = func(state json.RawMessage) error {
 		session.State = state
 		session.Claim = session.Cookies.GetWWWClaim()
 		return vault.Save(session)
 	}
 	if len(session.State) > 0 {
-		if err = c.LoadState(session.State); err != nil && err != instameow.ErrCachedStateTooOld {
+		if err = c.LoadState(session.State); err != nil && !errors.Is(err, instameow.ErrCachedStateTooOld) {
 			return fmt.Errorf("invalid cached connection state")
 		}
 	}

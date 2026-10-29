@@ -89,9 +89,19 @@ func (e *Engine) archive(ctx context.Context, raw []byte, spec pageSpec) error {
 		return errors.New("source did not provide pagination coverage")
 	}
 	now := time.Now().UnixMilli()
-	state := store.State{Cursor: page.Info.EndCursor, Complete: !page.Info.HasNextPage, LastSuccess: now}
-	stalled := !state.Complete && (state.Cursor == "" || state.Cursor == spec.Previous)
+	var prior store.State
+	if err := e.DB.State(ctx, e.Account, spec.Scope, spec.ID, &prior); err != nil {
+		return err
+	}
+	pageBytes := []byte{}
+	for _, edge := range page.Edges {
+		pageBytes = append(pageBytes, edge.Node...)
+		pageBytes = append(pageBytes, '\n')
+	}
+	state := store.State{Cursor: page.Info.EndCursor, Complete: !page.Info.HasNextPage, LastSuccess: now, PageHash: store.Hash(pageBytes)}
+	stalled := !state.Complete && (state.Cursor == "" || state.Cursor == spec.Previous || prior.PageHash == state.PageHash && prior.Cursor != state.Cursor)
 	if stalled {
+		state.Cursor = prior.Cursor
 		state.Error = "pagination cursor did not advance"
 		state.Gaps = []string{state.Error}
 	}
@@ -175,6 +185,11 @@ func (e *Engine) user(ctx context.Context, tx *sql.Tx, raw json.RawMessage, orig
 func (e *Engine) thread(ctx context.Context, tx *sql.Tx, raw json.RawMessage, origin string, now int64) error {
 	if err := store.Put(ctx, tx, store.Record{Table: "threads", Account: e.Account, Raw: raw, Origin: origin, Observed: now}); err != nil {
 		return err
+	}
+	if store.String(raw, "thread_fbid") == "" {
+		if err := store.SaveState(ctx, tx, e.Account, "thread", "unresolved:"+store.Identity("threads", raw), store.State{Error: "source thread lacks the thread_fbid needed for history acquisition"}); err != nil {
+			return err
+		}
 	}
 	var users []json.RawMessage
 	if err := json.Unmarshal(field(raw, "users"), &users); err == nil {
@@ -261,8 +276,17 @@ func (e *Engine) History(ctx context.Context) error {
 		if folder != "INBOX" && state.Complete {
 			state = store.State{}
 		}
+		seen := map[string]bool{}
 		for !state.Complete {
 			cursor := state.Cursor
+			if seen[cursor] {
+				state.Error = "folder pagination cycle detected"
+				if err := e.DB.SetState(ctx, e.Account, "folder", folder, state); err != nil {
+					return err
+				}
+				return errors.New(state.Error)
+			}
+			seen[cursor] = true
 			spec := pageSpec{Scope: "folder", ID: folder, Path: "fetch__SlideMailbox", Previous: cursor}
 			err := e.fetch(ctx, spec, func(ctx context.Context) error {
 				_, err := e.Client.PaginateMailbox(ctx, slidetypes.MakePaginateMailboxRequest(e.Client.GetOwnFBID(), cursor, folder, nil))
@@ -307,7 +331,22 @@ func (e *Engine) History(ctx context.Context) error {
 			failures++
 		}
 	}
-	state := store.State{Complete: failures == 0, LastSuccess: time.Now().UnixMilli(), Gaps: folderErrors}
+	var previous store.State
+	if err = e.DB.State(ctx, e.Account, "reconciliation", "history", &previous); err != nil {
+		return err
+	}
+	state := store.State{Complete: failures == 0 && len(folderErrors) == 0, LastSuccess: previous.LastSuccess, Gaps: folderErrors}
+	var unresolved int
+	if err = e.DB.DB.QueryRowContext(ctx, `SELECT count(DISTINCT source_identity) FROM threads WHERE account_id=? AND (thread_fbid IS NULL OR thread_fbid='')`, e.Account).Scan(&unresolved); err != nil {
+		return err
+	}
+	if unresolved > 0 {
+		state.Complete = false
+		state.Gaps = append(state.Gaps, fmt.Sprintf("%d source threads lack history acquisition identities", unresolved))
+	}
+	if state.Complete {
+		state.LastSuccess = time.Now().UnixMilli()
+	}
 	if failures > 0 {
 		state.Error = fmt.Sprintf("%d incomplete thread histories", failures)
 	}
@@ -336,6 +375,7 @@ func (e *Engine) historyThread(ctx context.Context, id string) error {
 	if err := e.DB.DB.QueryRowContext(ctx, `SELECT id FROM threads WHERE account_id=? AND thread_fbid=? AND id IS NOT NULL AND id!='' ORDER BY last_observed_at_ms DESC,record_id DESC LIMIT 1`, e.Account, id).Scan(&paginationID); err != nil {
 		return fmt.Errorf("missing source pagination identity: %w", err)
 	}
+	seen := map[string]bool{}
 	for {
 		var state store.State
 		if err := e.DB.State(ctx, e.Account, "thread", id, &state); err != nil {
@@ -345,6 +385,14 @@ func (e *Engine) historyThread(ctx context.Context, id string) error {
 			return nil
 		}
 		cursor := state.Cursor
+		if seen[cursor] {
+			state.Error = "message pagination cycle detected"
+			if err := e.DB.SetState(ctx, e.Account, "thread", id, state); err != nil {
+				return err
+			}
+			return errors.New(state.Error)
+		}
+		seen[cursor] = true
 		spec = pageSpec{Scope: "thread", ID: id, Path: "fetch__SlideThread", Messages: true, Previous: cursor}
 		if err := e.fetch(ctx, spec, func(ctx context.Context) error {
 			_, err := e.Client.PaginateMessages(ctx, &slidetypes.PaginateMessagesRequest{AfterCursor: &cursor, ThreadID: paginationID, FirstN: 20, InitialMessagePageCount: 20})

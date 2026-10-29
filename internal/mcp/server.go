@@ -39,11 +39,19 @@ func New(db *store.Store, account string, cache *media.Cache) *Server {
 	s := &Server{DB: db, Account: account, Cache: cache, SDK: sdk.NewServer(&sdk.Implementation{Name: "igdm-mirror", Version: "1"}, &sdk.ServerOptions{Instructions: "Read-only locally acquired Instagram source observations. Use original identifier namespaces (id:, thread_fbid:, message_id:). Partial coverage and reconstruction uncertainty are explicit. No Instagram actions are available."})}
 	tools := map[string]string{"list_accounts": "List locally known accounts and session metadata", "list_chats": "List conversation source snapshots", "get_chat": "Retrieve a conversation by an original namespaced source ID", "get_messages": "Retrieve conversation messages with bounded cursor pagination", "get_message": "Retrieve a message by an original namespaced source ID", "get_user": "Retrieve an identifiable user profile observation", "search_messages": "Search original message text paths with account, thread, sender and time filters", "get_media": "Retrieve locally cached media acquisition metadata", "get_sync_status": "Inspect synchronization coverage, progress, and recoverable gaps"}
 	for name, description := range tools {
-		sdk.AddTool(s.SDK, &sdk.Tool{Name: name, Description: description, OutputSchema: map[string]any{"type": "object", "properties": map[string]any{
+		tool := &sdk.Tool{Name: name, Description: description, OutputSchema: map[string]any{"type": "object", "properties": map[string]any{
 			"media": map[string]any{"type": "array", "items": map[string]any{"type": "object"}}, "items": map[string]any{"type": "array", "items": map[string]any{"type": "object"}},
 			"status":      map[string]any{"type": "array", "items": map[string]any{"type": "object"}},
 			"next_cursor": map[string]any{"type": "string"}, "availability": map[string]any{"type": "string"},
-		}}, Annotations: &sdk.ToolAnnotations{ReadOnlyHint: true}}, func(ctx context.Context, _ *sdk.CallToolRequest, q store.Query) (*sdk.CallToolResult, Response, error) {
+		}}, Annotations: &sdk.ToolAnnotations{ReadOnlyHint: true}}
+		if name == "list_accounts" {
+			sdk.AddTool(s.SDK, tool, func(ctx context.Context, _ *sdk.CallToolRequest, _ struct{}) (*sdk.CallToolResult, Response, error) {
+				out, err := s.call(ctx, name, store.Query{})
+				return nil, out, err
+			})
+			continue
+		}
+		sdk.AddTool(s.SDK, tool, func(ctx context.Context, _ *sdk.CallToolRequest, q store.Query) (*sdk.CallToolResult, Response, error) {
 			out, err := s.call(ctx, name, q)
 			return nil, out, err
 		})

@@ -155,7 +155,10 @@ func (s *Store) Query(ctx context.Context, table string, q Query) (Page, error) 
 				return out, errors.New("text query too long")
 			}
 			outer += ` AND (instr(lower(coalesce(json_extract(raw,'$.text_body'),'')),lower(?))>0 OR instr(lower(coalesce(json_extract(raw,'$.content.text_body'),'')),lower(?))>0 OR instr(lower(coalesce(json_extract(raw,'$.content.xma_text_body'),'')),lower(?))>0 OR instr(lower(coalesce(json_extract(raw,'$.content.xma.caption_body_text'),'')),lower(?))>0 OR instr(lower(coalesce(json_extract(raw,'$.igd_snippet'),'')),lower(?))>0)`
-			for range 5 {
+			// Edits remain source deltas; match their text without manufacturing a
+			// replacement message object. Projection returns their source references.
+			outer = strings.TrimSuffix(outer, ")") + ` OR EXISTS (SELECT 1 FROM deltas d WHERE d.account_id=ranked.account_id AND (d.message_id=ranked.message_id OR d.message_id=ranked.id) AND (d.thread_fbid=ranked.thread_fbid OR d.thread_fbid=ranked.acquired_thread_id) AND instr(lower(coalesce(json_extract(d.raw,'$.text_body'),'')),lower(?))>0))`
+			for range 6 {
 				outerArgs = append(outerArgs, q.Text)
 			}
 		}
@@ -164,7 +167,11 @@ func (s *Store) Query(ctx context.Context, table string, q Query) (Page, error) 
 	if table == "users" {
 		rankOrder = "(json_type(raw,'$.username') IS NOT NULL) DESC,(json_type(raw,'$.full_name') IS NOT NULL) DESC," + rankOrder
 	}
-	sqlText := `WITH ranked AS (SELECT *,row_number() OVER(PARTITION BY source_identity ORDER BY ` + rankOrder + `) AS rank FROM ` + table + ` WHERE ` + where + `) SELECT record_id,account_id,source_identity,acquired_thread_id,origin,observed_at_ms,last_observed_at_ms,source_hash,raw FROM ranked WHERE rank=1 AND ` + outer + ` ORDER BY record_id DESC LIMIT ?`
+	rankFilter := "rank=1"
+	if q.Text != "" {
+		rankFilter = "rank>=1"
+	}
+	sqlText := `WITH ranked AS (SELECT *,row_number() OVER(PARTITION BY source_identity ORDER BY ` + rankOrder + `) AS rank FROM ` + table + ` WHERE ` + where + `) SELECT record_id,account_id,source_identity,acquired_thread_id,origin,observed_at_ms,last_observed_at_ms,source_hash,raw FROM ranked WHERE ` + rankFilter + ` AND ` + outer + ` ORDER BY record_id DESC LIMIT ?`
 	args = append(args, outerArgs...)
 	args = append(args, q.Limit+1)
 	rows, err := s.DB.QueryContext(ctx, sqlText, args...)

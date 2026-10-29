@@ -287,7 +287,6 @@ type BrowserState string
 // AP = Authentication Platform
 const (
 	StateUnknown                BrowserState = ""
-	StateTestCaptcha            BrowserState = "test-captcha"
 	StateInitialMessenger       BrowserState = "initial-messenger"
 	StateInitialInstagram       BrowserState = "initial-instagram"
 	StateLandingPage            BrowserState = "landing-page"
@@ -1227,43 +1226,6 @@ func (b *Browser) DoLoginStep(ctx context.Context, userInput map[string]string) 
 				return nil, fmt.Errorf("executing dialog action: %w", err)
 			}
 		}
-
-	case StateTestCaptcha:
-		if userInput["captcha_code"] == "" {
-			step = &bridgev2.LoginStep{
-				Type:         bridgev2.LoginStepTypeUserInput,
-				StepID:       b.stepID("captcha"),
-				Instructions: "Here is a test captcha",
-				UserInputParams: &bridgev2.LoginUserInputParams{
-					Attachments: []*bridgev2.LoginUserInputAttachment{
-						{
-							Type:     event.MsgImage,
-							FileName: "captcha.png",
-							Content:  debugImageCaptcha,
-							Info: bridgev2.LoginUserInputAttachmentInfo{
-								MimeType: "image/png",
-								Width:    280,
-								Height:   70,
-								Size:     len(debugImageCaptcha),
-							},
-						}, {
-							Type:     event.MsgAudio,
-							FileName: "captcha.ogg",
-							Content:  debugAudioCaptcha,
-							Info: bridgev2.LoginUserInputAttachmentInfo{
-								MimeType: "audio/ogg",
-								Size:     len(debugAudioCaptcha),
-							},
-						},
-					},
-					Fields: []bridgev2.LoginInputDataField{
-						{ID: "captcha_code", Name: "Captcha code", Type: bridgev2.LoginInputFieldTypeCaptchaCode},
-					},
-				},
-			}
-			break
-		}
-		b.State = b.profile.initialState
 
 	case StateInitialInstagram:
 		rpc := "com.bloks.www.caa.login.login_homepage"

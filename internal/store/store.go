@@ -32,6 +32,7 @@ type Record struct {
 }
 
 type State struct {
+	PageHash    string   `json:"page_hash,omitempty"`
 	Cursor      string   `json:"cursor,omitempty"`
 	Complete    bool     `json:"complete"`
 	SeqID       int64    `json:"seq_id,omitempty"`
@@ -43,6 +44,14 @@ type State struct {
 
 func Open(path string) (*Store, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return nil, err
+	}
+	if err := os.Chmod(filepath.Dir(path), 0700); err != nil {
+		return nil, err
+	}
+	if info, err := os.Lstat(path); err == nil && !info.Mode().IsRegular() {
+		return nil, errors.New("database must be a regular file")
+	} else if err != nil && !os.IsNotExist(err) {
 		return nil, err
 	}
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)

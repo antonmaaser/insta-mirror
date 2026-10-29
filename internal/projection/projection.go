@@ -1,6 +1,7 @@
 package projection
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/url"
@@ -27,7 +28,7 @@ type Result struct {
 func Build(ctx context.Context, db *store.Store, r store.Record, includeRaw bool) (Result, error) {
 	out := Result{Source: r, Reference: store.SourceRef(r), Completeness: "partial"}
 	var snapshot map[string]any
-	if err := json.Unmarshal(r.Raw, &snapshot); err != nil {
+	if err := decodeObject(r.Raw, &snapshot); err != nil {
 		return out, err
 	}
 	out.Snapshot = snapshot
@@ -74,8 +75,7 @@ func Build(ctx context.Context, db *store.Store, r store.Record, includeRaw bool
 			out.Uncertainty = append(out.Uncertainty, "snapshot and realtime sequence are not directly comparable; candidate updates were not applied")
 		}
 		var current map[string]any
-		b, _ := json.Marshal(snapshot)
-		_ = json.Unmarshal(b, &current)
+		_ = decodeObject(r.Raw, &current)
 		for _, record := range deltas {
 			var d slidetypes.Delta
 			if err = json.Unmarshal(record.Raw, &d); err != nil {
@@ -154,7 +154,7 @@ func applyReaction(message map[string]any, reaction slidetypes.Reaction, remove 
 				continue
 			}
 			sender, _ := obj["sender_fbid"].(string)
-			if sender != strconv.FormatInt(reaction.SenderFBID, 10) {
+			if sender != strconv.FormatInt(reaction.SenderFBID, 10) || remove && reaction.Reaction != "" && obj["reaction"] != reaction.Reaction {
 				out = append(out, item)
 			}
 		}
@@ -169,4 +169,10 @@ func applyReaction(message map[string]any, reaction slidetypes.Reaction, remove 
 		out = []any{}
 	}
 	message["reactions"] = out
+}
+
+func decodeObject(b []byte, out *map[string]any) error {
+	decoder := json.NewDecoder(bytes.NewReader(b))
+	decoder.UseNumber()
+	return decoder.Decode(out)
 }
