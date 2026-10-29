@@ -6,3 +6,5 @@
 *.enc
 /media/
 /sessions/
+/data/
+/session.key

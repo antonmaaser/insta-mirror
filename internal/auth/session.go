@@ -70,29 +70,16 @@ func Prompt(label string, secret bool) (string, error) {
 	return strings.TrimSpace(string(line)), nil
 }
 func Unlock(dir, secretFile string) (*Vault, error) {
-	if err := os.MkdirAll(filepath.Join(dir, "sessions"), 0700); err != nil {
-		return nil, err
-	}
-	if err := os.Chmod(filepath.Join(dir, "sessions"), 0700); err != nil {
+	if err := prepareSessionDir(dir); err != nil {
 		return nil, err
 	}
 	var password []byte
 	if secretFile != "" {
-		info, err := os.Lstat(secretFile)
+		var err error
+		password, err = readSecretFile(secretFile)
 		if err != nil {
 			return nil, err
 		}
-		if !info.Mode().IsRegular() || info.Mode().Perm()&0077 != 0 {
-			return nil, errors.New("secret file must be a regular file accessible only by its owner")
-		}
-		if info.Size() > 4096 {
-			return nil, errors.New("secret file too large")
-		}
-		password, err = os.ReadFile(secretFile)
-		if err != nil {
-			return nil, err
-		}
-		password = []byte(strings.TrimRight(string(password), "\r\n"))
 	} else {
 		v, err := Prompt("Session encryption passphrase", true)
 		if err != nil {

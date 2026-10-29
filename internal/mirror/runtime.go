@@ -26,25 +26,37 @@ func newClient(c *cookies.Cookies) *instameow.Client {
 }
 func Run(ctx context.Context, args []string) (runErr error) {
 	if len(args) == 0 || args[0] == "--help" || args[0] == "help" {
-		fmt.Fprintln(os.Stdout, "igdm-mirror {login|sync --once|sync --follow|serve|status} [--data-dir DIR] [--account ID] [--secret-file FILE]")
+		fmt.Fprintln(os.Stdout, "igdm-mirror {setup|login|sync --once|sync --follow|serve|status} [--data-dir DIR] [--account ID] [--secret-file FILE]")
+		fmt.Fprintln(os.Stdout, "Run setup before login. Defaults: data/ and session.key beside the executable; override with IGDM_DATA_DIR and IGDM_SECRET_FILE.")
 		return nil
 	}
 	command := args[0]
-	if command != "login" && command != "sync" && command != "serve" && command != "status" {
+	if command != "setup" && command != "login" && command != "sync" && command != "serve" && command != "status" {
 		return fmt.Errorf("unknown command %q", command)
 	}
 	fs := flag.NewFlagSet(command, flag.ContinueOnError)
 	defaultDir := os.Getenv("IGDM_DATA_DIR")
-	if defaultDir == "" {
-		base, err := os.UserConfigDir()
+	defaultSecret := os.Getenv("IGDM_SECRET_FILE")
+	if defaultDir == "" || defaultSecret == "" {
+		executable, err := os.Executable()
 		if err != nil {
 			return err
 		}
-		defaultDir = filepath.Join(base, "igdm-mirror")
+		executable, err = filepath.EvalSymlinks(executable)
+		if err != nil {
+			return err
+		}
+		base := filepath.Dir(executable)
+		if defaultDir == "" {
+			defaultDir = filepath.Join(base, "data")
+		}
+		if defaultSecret == "" {
+			defaultSecret = filepath.Join(base, "session.key")
+		}
 	}
 	dir := fs.String("data-dir", defaultDir, "private data directory")
 	account := fs.String("account", "", "numeric Instagram account ID")
-	secret := fs.String("secret-file", os.Getenv("IGDM_SECRET_FILE"), "owner-only session passphrase file")
+	secret := fs.String("secret-file", defaultSecret, "owner-only session passphrase file")
 	imported := fs.Bool("cookies", false, "import cookies interactively instead of password login")
 	once := fs.Bool("once", false, "finish pending historical work and exit")
 	follow := fs.Bool("follow", false, "maintain realtime synchronization")
@@ -57,11 +69,29 @@ func Run(ctx context.Context, args []string) (runErr error) {
 	if fs.NArg() != 0 {
 		return fmt.Errorf("unexpected arguments")
 	}
+	if *dir == "" {
+		return fmt.Errorf("data directory must not be empty")
+	}
+	if command == "setup" {
+		if err := auth.Setup(*dir, *secret); err != nil {
+			return err
+		}
+	}
 	db, err := store.Open(filepath.Join(*dir, "mirror.db"))
 	if err != nil {
 		return err
 	}
 	defer db.Close()
+	if command == "setup" {
+		mediaDir := filepath.Join(*dir, "media")
+		if err := os.MkdirAll(mediaDir, 0700); err != nil {
+			return err
+		}
+		if err := os.Chmod(mediaDir, 0700); err != nil {
+			return err
+		}
+		return json.NewEncoder(os.Stdout).Encode(map[string]any{"ready_for_login": true, "data_dir": *dir, "secret_file": *secret})
+	}
 	if command == "status" {
 		status, err := db.Status(ctx, *account)
 		if err != nil {
