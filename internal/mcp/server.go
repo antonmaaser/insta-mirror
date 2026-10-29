@@ -16,28 +16,31 @@ import (
 	"time"
 
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
+	"go.mau.fi/mautrix-meta/internal/media"
 	"go.mau.fi/mautrix-meta/internal/projection"
 	"go.mau.fi/mautrix-meta/internal/store"
 )
 
 type Server struct {
+	Cache   *media.Cache
 	DB      *store.Store
 	Account string
 	SDK     *sdk.Server
 }
 type Response struct {
+	Media        []store.Media       `json:"media,omitempty"`
 	Items        []projection.Result `json:"items,omitempty"`
 	Status       []map[string]any    `json:"status,omitempty"`
 	Next         string              `json:"next_cursor,omitempty"`
 	Availability string              `json:"availability,omitempty"`
 }
 
-func New(db *store.Store, account string) *Server {
-	s := &Server{DB: db, Account: account, SDK: sdk.NewServer(&sdk.Implementation{Name: "igdm-mirror", Version: "1"}, &sdk.ServerOptions{Instructions: "Read-only locally acquired Instagram source observations. Use original identifier namespaces (id:, thread_fbid:, message_id:). Partial coverage and reconstruction uncertainty are explicit. No Instagram actions are available."})}
+func New(db *store.Store, account string, cache *media.Cache) *Server {
+	s := &Server{DB: db, Account: account, Cache: cache, SDK: sdk.NewServer(&sdk.Implementation{Name: "igdm-mirror", Version: "1"}, &sdk.ServerOptions{Instructions: "Read-only locally acquired Instagram source observations. Use original identifier namespaces (id:, thread_fbid:, message_id:). Partial coverage and reconstruction uncertainty are explicit. No Instagram actions are available."})}
 	tools := map[string]string{"list_accounts": "List locally known accounts and session metadata", "list_chats": "List conversation source snapshots", "get_chat": "Retrieve a conversation by an original namespaced source ID", "get_messages": "Retrieve conversation messages with bounded cursor pagination", "get_message": "Retrieve a message by an original namespaced source ID", "get_user": "Retrieve an identifiable user profile observation", "search_messages": "Search original message text paths with account, thread, sender and time filters", "get_media": "Retrieve locally cached media acquisition metadata", "get_sync_status": "Inspect synchronization coverage, progress, and recoverable gaps"}
 	for name, description := range tools {
 		sdk.AddTool(s.SDK, &sdk.Tool{Name: name, Description: description, OutputSchema: map[string]any{"type": "object", "properties": map[string]any{
-			"items":       map[string]any{"type": "array", "items": map[string]any{"type": "object"}},
+			"media": map[string]any{"type": "array", "items": map[string]any{"type": "object"}}, "items": map[string]any{"type": "array", "items": map[string]any{"type": "object"}},
 			"status":      map[string]any{"type": "array", "items": map[string]any{"type": "object"}},
 			"next_cursor": map[string]any{"type": "string"}, "availability": map[string]any{"type": "string"},
 		}}, Annotations: &sdk.ToolAnnotations{ReadOnlyHint: true}}, func(ctx context.Context, _ *sdk.CallToolRequest, q store.Query) (*sdk.CallToolResult, Response, error) {
@@ -45,7 +48,7 @@ func New(db *store.Store, account string) *Server {
 			return nil, out, err
 		})
 	}
-	for _, template := range []string{"igdm://accounts/{account_id}/threads/{thread_id}", "igdm://accounts/{account_id}/threads/{thread_id}/messages/{message_id}", "igdm://accounts/{account_id}/records/{kind}/{record_id}"} {
+	for _, template := range []string{"igdm://accounts/{account_id}/threads/{thread_id}", "igdm://accounts/{account_id}/threads/{thread_id}/messages/{message_id}", "igdm://accounts/{account_id}/records/{kind}/{record_id}", "igdm://accounts/{account_id}/media/{hash}"} {
 		s.SDK.AddResourceTemplate(&sdk.ResourceTemplate{Name: "Instagram source", URITemplate: template, MIMEType: "application/json"}, s.readResource)
 	}
 	return s
@@ -115,7 +118,25 @@ func (s *Server) call(ctx context.Context, name string, q store.Query) (Response
 	return out, nil
 }
 func (s *Server) media(ctx context.Context, q store.Query) (Response, error) {
-	return Response{Availability: "unavailable"}, nil
+	out := Response{Availability: "unavailable", Media: []store.Media{}}
+	if q.SourceID == "" {
+		return out, errors.New("source_id requires the namespaced message identifier")
+	}
+	page, err := s.DB.Query(ctx, "messages", q)
+	if err != nil {
+		return out, err
+	}
+	for _, r := range page.Records {
+		items, err := s.DB.Media(ctx, q.Account, r.RowID)
+		if err != nil {
+			return out, err
+		}
+		out.Media = append(out.Media, items...)
+	}
+	if len(out.Media) > 0 {
+		out.Availability = "partial"
+	}
+	return out, nil
 }
 func (s *Server) readResource(ctx context.Context, req *sdk.ReadResourceRequest) (*sdk.ReadResourceResult, error) {
 	uri := req.Params.URI
@@ -131,6 +152,30 @@ func (s *Server) readResource(ctx context.Context, req *sdk.ReadResourceRequest)
 		return nil, err
 	}
 	var value any
+	if parts[1] == "media" && len(parts) == 3 {
+		if s.Cache == nil {
+			return nil, errors.New("media cache unavailable")
+		}
+		offset := int64(0)
+		length := media.ChunkSize
+		if text := u.Query().Get("offset"); text != "" {
+			offset, err = strconv.ParseInt(text, 10, 64)
+			if err != nil {
+				return nil, errors.New("invalid media offset")
+			}
+		}
+		if text := u.Query().Get("length"); text != "" {
+			length, err = strconv.ParseInt(text, 10, 64)
+			if err != nil {
+				return nil, errors.New("invalid media length")
+			}
+		}
+		b, m, err := s.Cache.Read(ctx, s.Account, parts[2], offset, length)
+		if err != nil {
+			return nil, err
+		}
+		return &sdk.ReadResourceResult{Contents: []*sdk.ResourceContents{{URI: uri, MIMEType: m.MIME, Blob: b, Meta: sdk.Meta{"offset": offset, "byte_size": m.Size, "returned_bytes": len(b), "partial": offset != 0 || int64(len(b)) < m.Size}}}}, nil
+	}
 	if parts[1] == "records" && len(parts) == 4 {
 		row, err := strconv.ParseInt(parts[3], 10, 64)
 		if err != nil || row <= 0 {

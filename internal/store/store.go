@@ -63,6 +63,14 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
+	if err = s.InitializeMedia(); err != nil {
+		db.Close()
+		return nil, err
+	}
+	if _, err = db.Exec("PRAGMA user_version=2"); err != nil {
+		db.Close()
+		return nil, err
+	}
 	return s, nil
 }
 func (s *Store) Close() error { return s.DB.Close() }
@@ -76,7 +84,7 @@ func (s *Store) initialize() error {
 	if err := s.DB.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
 		return err
 	}
-	if version > 1 {
+	if version > 2 {
 		return fmt.Errorf("unsupported schema version %d", version)
 	}
 	tx, err := s.DB.Begin()

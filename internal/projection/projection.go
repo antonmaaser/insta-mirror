@@ -12,6 +12,7 @@ import (
 )
 
 type Result struct {
+	Media         []store.Media  `json:"media,omitempty"`
 	Source        store.Record   `json:"source"`
 	Reference     string         `json:"source_reference"`
 	Resource      string         `json:"resource_uri,omitempty"`
@@ -32,6 +33,11 @@ func Build(ctx context.Context, db *store.Store, r store.Record, includeRaw bool
 	out.Snapshot = snapshot
 	threadRefs := []string{}
 	if r.Table == "messages" {
+		media, err := db.Media(ctx, r.Account, r.RowID)
+		if err != nil {
+			return out, err
+		}
+		out.Media = media
 		var message slidetypes.Message
 		if err := json.Unmarshal(r.Raw, &message); err != nil {
 			out.Uncertainty = append(out.Uncertainty, "upstream message decoding failed; source fields retained")

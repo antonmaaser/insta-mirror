@@ -12,6 +12,7 @@ import (
 	"github.com/rs/zerolog"
 	"go.mau.fi/mautrix-meta/internal/auth"
 	"go.mau.fi/mautrix-meta/internal/mcp"
+	"go.mau.fi/mautrix-meta/internal/media"
 	"go.mau.fi/mautrix-meta/internal/store"
 	"go.mau.fi/mautrix-meta/pkg/instameow"
 	"go.mau.fi/mautrix-meta/pkg/messagix/cookies"
@@ -93,8 +94,30 @@ func Run(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	cache, err := media.New(db, filepath.Join(*dir, "media"))
+	if err != nil {
+		return err
+	}
+	defer cache.Close()
 	workCtx, abort := context.WithCancelCause(ctx)
 	defer abort(context.Canceled)
+	mediaDone := make(chan struct{})
+	go func() {
+		defer close(mediaDone)
+		for {
+			if err := cache.Sync(workCtx, session.Account); err != nil && workCtx.Err() == nil {
+				_ = db.SetState(ctx, session.Account, "account", "media", store.State{Error: "media acquisition failed; retry pending"})
+			}
+			timer := time.NewTimer(time.Minute)
+			select {
+			case <-workCtx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
+		}
+	}()
+	defer func() { abort(context.Canceled); <-mediaDone }()
 	e := &Engine{DB: db, Account: session.Account, Abort: abort, Reconcile: make(chan struct{}, 1)}
 	c := instameow.NewClient(instameow.ClientParams{Cookies: session.Cookies, Log: zerolog.New(os.Stderr).Level(zerolog.Disabled), DisableTyping: true, RawGraphQLResponse: captureGraphQL, RawDeltaResponse: e.captureDeltas, EventHandler: e.event})
 	e.Client = c
@@ -125,7 +148,7 @@ func Run(ctx context.Context, args []string) error {
 			}
 			done <- syncErr
 		}()
-		serveErr := mcp.New(db, session.Account).Run(ctx, *httpAddress, *httpToken, *allowNetwork)
+		serveErr := mcp.New(db, session.Account, cache).Run(ctx, *httpAddress, *httpToken, *allowNetwork)
 		abort(context.Canceled)
 		c.Disconnect()
 		<-done
@@ -140,5 +163,11 @@ func Run(ctx context.Context, args []string) error {
 		}
 		return e.Follow(workCtx)
 	}
-	return e.History(workCtx)
+	historyErr := e.History(workCtx)
+	abort(context.Canceled)
+	<-mediaDone
+	if historyErr != nil {
+		return historyErr
+	}
+	return cache.Sync(ctx, session.Account)
 }
