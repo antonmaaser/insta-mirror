@@ -186,13 +186,20 @@ func (c *Cache) Sync(ctx context.Context, account string) error {
 				m := existing[a.ref]
 				urlBytes, _ := json.Marshal(a.urls)
 				urlHash := store.Hash(urlBytes)
-				if m.Status == "available" && c.exists(m.Hash) {
+				if !a.blocked && m.Status == "available" && c.exists(m.Hash) {
 					continue
 				}
-				if m.URLHash == urlHash && (m.Status == "unavailable" || m.Status == "restricted" || m.Attempted > time.Now().Add(-time.Hour).UnixMilli()) {
+				if (!a.blocked || m.Status == "restricted" && m.Version == r.RowID) && m.URLHash == urlHash && (m.Status == "unavailable" || m.Status == "restricted" || m.Attempted > time.Now().Add(-time.Hour).UnixMilli()) {
 					continue
 				}
 				m = store.Media{Account: account, Record: r.RowID, Attachment: a.ref, URLHash: urlHash, Attempted: time.Now().UnixMilli(), Attempts: m.Attempts + 1}
+				m.Version = r.RowID
+				if !a.blocked && len(a.urls) > 0 {
+					m.Version, err = c.DB.AttachmentVersion(ctx, account, r.RowID, a.ref, a.urls[0])
+					if err != nil {
+						return err
+					}
+				}
 				if a.blocked {
 					m.Status = "restricted"
 					m.Error = "ephemeral or expired media is not acquired"

@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"net/url"
 	"strconv"
 	"strings"
 
@@ -13,16 +12,18 @@ import (
 )
 
 type Result struct {
-	Media         []store.Media  `json:"media,omitempty"`
-	Source        store.Record   `json:"source"`
-	Reference     string         `json:"source_reference"`
-	Resource      string         `json:"resource_uri,omitempty"`
-	Snapshot      any            `json:"snapshot"`
-	Reconstructed any            `json:"reconstructed,omitempty"`
-	Updates       []store.Record `json:"updates,omitempty"`
-	Completeness  string         `json:"completeness"`
-	Uncertainty   []string       `json:"uncertainty,omitempty"`
-	Deleted       bool           `json:"deleted,omitempty"`
+	Media          []store.Media       `json:"media,omitempty"`
+	Source         store.Record        `json:"source"`
+	Reference      string              `json:"source_reference"`
+	Resource       string              `json:"resource_uri,omitempty"`
+	Snapshot       any                 `json:"snapshot"`
+	Reconstructed  any                 `json:"reconstructed,omitempty"`
+	Updates        []store.Record      `json:"updates,omitempty"`
+	Completeness   string              `json:"completeness"`
+	Uncertainty    []string            `json:"uncertainty,omitempty"`
+	FieldSources   map[string][]string `json:"field_sources,omitempty"`
+	Interpretation string              `json:"interpretation,omitempty"`
+	Deleted        bool                `json:"deleted,omitempty"`
 }
 
 func Build(ctx context.Context, db *store.Store, r store.Record, includeRaw bool) (Result, error) {
@@ -32,6 +33,24 @@ func Build(ctx context.Context, db *store.Store, r store.Record, includeRaw bool
 		return out, err
 	}
 	out.Snapshot = snapshot
+	if r.Entity != 0 {
+		out.Resource = store.EntityRef(r)
+	}
+	if r.Table == "users" || r.Table == "threads" {
+		current, sources, err := CurrentFields(ctx, db, r)
+		if err != nil {
+			return out, err
+		}
+		out.Reconstructed = current
+		out.FieldSources = sources
+		for _, refs := range sources {
+			if len(refs) > 1 {
+				out.Uncertainty = append(out.Uncertainty, "conflicting fields in the same acquisition were omitted from the interpreted view; inspect field_sources")
+				break
+			}
+		}
+		out.Interpretation = "latest locally observed fields; no claim of current source state"
+	}
 	threadRefs := []string{}
 	if r.Table == "messages" {
 		media, err := db.Media(ctx, r.Account, r.RowID)
@@ -43,13 +62,10 @@ func Build(ctx context.Context, db *store.Store, r store.Record, includeRaw bool
 		if err := json.Unmarshal(r.Raw, &message); err != nil {
 			out.Uncertainty = append(out.Uncertainty, "upstream message decoding failed; source fields retained")
 		}
-		if message.ThreadFBID != "" {
-			threadRefs = append(threadRefs, message.ThreadFBID)
+		threadRefs, err = db.MessageThreadReferences(ctx, r.Account, r.Version)
+		if err != nil {
+			return out, err
 		}
-		if r.Thread != "" {
-			threadRefs = append(threadRefs, r.Thread)
-		}
-		out.Resource = "igdm://accounts/" + r.Account + "/threads/" + url.PathEscape("thread_fbid:"+message.ThreadFBID) + "/messages/" + url.PathEscape(r.Identity)
 		ids := []string{}
 		if message.ID != "" {
 			ids = append(ids, message.ID)
@@ -65,10 +81,7 @@ func Build(ctx context.Context, db *store.Store, r store.Record, includeRaw bool
 		if truncated {
 			out.Uncertainty = append(out.Uncertainty, "delta window exceeds 200 events")
 		}
-		seq := int64(0)
-		if strings.HasPrefix(r.Origin, "dgw:") {
-			seq, _ = strconv.ParseInt(strings.TrimPrefix(r.Origin, "dgw:"), 10, 64)
-		}
+		seq := r.Sequence
 		// Realtime new-message snapshots carry their source sequence. GraphQL
 		// snapshots have no comparable sequence; expose updates without guessing.
 		if len(deltas) > 0 && seq == 0 {
@@ -106,6 +119,7 @@ func Build(ctx context.Context, db *store.Store, r store.Record, includeRaw bool
 			}
 		}
 		if seq > 0 {
+			out.Interpretation = "snapshot plus source-ordered deltas"
 			out.Reconstructed = current
 		}
 	} else if r.Table == "threads" {
@@ -113,11 +127,10 @@ func Build(ctx context.Context, db *store.Store, r store.Record, includeRaw bool
 		if err := json.Unmarshal(r.Raw, &thread); err != nil {
 			out.Uncertainty = append(out.Uncertainty, "upstream thread decoding failed")
 		}
-		out.Resource = "igdm://accounts/" + r.Account + "/threads/" + url.PathEscape(r.Identity)
-		for _, v := range []string{thread.ID, thread.ThreadFBID} {
-			if v != "" {
-				threadRefs = append(threadRefs, v)
-			}
+		var err error
+		threadRefs, err = db.ThreadReferences(ctx, r.Account, r.Identity)
+		if err != nil {
+			return out, err
 		}
 		updates, truncated, err := db.Deltas(ctx, r.Account, threadRefs, nil)
 		if err != nil {
@@ -175,4 +188,88 @@ func decodeObject(b []byte, out *map[string]any) error {
 	decoder := json.NewDecoder(bytes.NewReader(b))
 	decoder.UseNumber()
 	return decoder.Decode(out)
+}
+
+// CurrentFields composes observations only for presentation. Arrays and explicit
+// nulls replace prior values; missing object fields retain their prior evidence.
+// The original source versions are never rewritten to contain this composition.
+func CurrentFields(ctx context.Context, db *store.Store, r store.Record) (map[string]any, map[string][]string, error) {
+	versions, err := db.FieldVersions(ctx, r)
+	if err != nil {
+		return nil, nil, err
+	}
+	current := map[string]any{}
+	sources := map[string][]string{}
+	seen := map[string]int64{}
+	values := map[string]string{}
+	objects := map[string]bool{}
+	conflicts := map[string]int64{}
+	var merge func(map[string]any, map[string]any, string, string, int64)
+	merge = func(dst, src map[string]any, path, ref string, observation int64) {
+		for key, value := range src {
+			if r.Table == "threads" && path == "" && key == "slide_messages" {
+				continue
+			}
+			pointer := path + "/" + strings.ReplaceAll(strings.ReplaceAll(key, "~", "~0"), "/", "~1")
+			object, isObject := value.(map[string]any)
+			isObject = isObject && len(object) > 0
+			encoded, _ := json.Marshal(value)
+			same := seen[pointer] == observation && seen[pointer] != 0
+			ambiguous := same && (objects[pointer] != isObject || !isObject && values[pointer] != string(encoded))
+			if conflicts[pointer] == observation && observation != 0 {
+				ambiguous = true
+			}
+			if ambiguous {
+				delete(dst, key)
+				conflicts[pointer] = observation
+				present := false
+				for _, old := range sources[pointer] {
+					if old == ref {
+						present = true
+					}
+				}
+				if !present {
+					sources[pointer] = append(sources[pointer], ref)
+				}
+				for old := range sources {
+					if strings.HasPrefix(old, pointer+"/") {
+						delete(sources, old)
+					}
+				}
+				continue
+			}
+			seen[pointer] = observation
+			objects[pointer] = isObject
+			values[pointer] = string(encoded)
+			delete(conflicts, pointer)
+			if isObject {
+				existing, ok := dst[key].(map[string]any)
+				if !ok {
+					existing = map[string]any{}
+					dst[key] = existing
+				}
+				merge(existing, object, pointer, ref, observation)
+			} else {
+				dst[key] = value
+				for old := range sources {
+					if strings.HasPrefix(old, pointer+"/") {
+						delete(sources, old)
+						delete(seen, old)
+						delete(values, old)
+						delete(objects, old)
+						delete(conflicts, old)
+					}
+				}
+			}
+			sources[pointer] = []string{ref}
+		}
+	}
+	for _, v := range versions {
+		var fields map[string]any
+		if err = decodeObject(v.Raw, &fields); err != nil {
+			return nil, nil, err
+		}
+		merge(current, fields, "", store.SourceRef(v), v.Observation)
+	}
+	return current, sources, nil
 }

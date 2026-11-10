@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -74,6 +75,10 @@ func nodeID(n *sourceNode) string {
 		if json.Unmarshal(n.scalar, &s) != nil {
 			return ""
 		}
+		encoded, _ := json.Marshal(s)
+		if !bytes.Equal(encoded, n.scalar) {
+			return ""
+		}
 	} else {
 		s = string(n.scalar)
 		for _, c := range s {
@@ -120,7 +125,7 @@ func aliases(kind string, n *sourceNode) []sourceAlias {
 }
 
 // Only explicit source pairings unify identity. Different established IG user
-// IDs are a conflict, not evidence that two people should be merged.
+// or long thread IDs are a conflict, not grounds for an automatic merge.
 func resolveAliases(ctx context.Context, tx *sql.Tx, account, kind string, list []sourceAlias) (int64, []int64, error) {
 	if len(list) == 0 {
 		return 0, nil, nil
@@ -139,15 +144,19 @@ func resolveAliases(ctx context.Context, tx *sql.Tx, account, kind string, list 
 			return 0, nil, err
 		}
 	}
-	if kind == "users" {
+	if kind == "users" || kind == "threads" {
+		primary := "user.igid"
+		if kind == "threads" {
+			primary = "thread.igid"
+		}
 		igids := map[string]bool{}
 		for _, a := range list {
-			if a.namespace == "user.igid" {
+			if a.namespace == primary {
 				igids[a.value] = true
 			}
 		}
 		for owner := range owners {
-			rows, err := tx.QueryContext(ctx, `SELECT value FROM source_ids WHERE account_id=? AND user_entity_id=? AND namespace='user.igid'`, account, owner)
+			rows, err := tx.QueryContext(ctx, `SELECT value FROM source_ids WHERE account_id=? AND `+col+`=? AND namespace=?`, account, owner, primary)
 			if err != nil {
 				return 0, nil, err
 			}
@@ -186,6 +195,16 @@ func resolveAliases(ctx context.Context, tx *sql.Tx, account, kind string, list 
 		}
 		sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 		root = ids[0]
+		if len(ids) > 1 {
+			var revision State
+			if err := ReadState(ctx, tx, account, "identity", "revision", &revision); err != nil {
+				return 0, nil, err
+			}
+			revision.Revision++
+			if err := SaveState(ctx, tx, account, "identity", "revision", revision); err != nil {
+				return 0, nil, err
+			}
+		}
 		for _, id := range ids[1:] {
 			if _, err := tx.ExecContext(ctx, `UPDATE source_ids SET `+col+`=? WHERE account_id=? AND `+col+`=?`, root, account, id); err != nil {
 				return 0, nil, err
@@ -199,7 +218,7 @@ func resolveAliases(ctx context.Context, tx *sql.Tx, account, kind string, list 
 	var ids []int64
 	for _, a := range list {
 		var id int64
-		err := tx.QueryRowContext(ctx, `INSERT INTO source_ids(account_id,namespace,scope,value,`+col+`,evidence_field) VALUES(?,?,?,?,?,?) ON CONFLICT(account_id,namespace,scope,value) DO UPDATE SET `+col+`=excluded.`+col+` RETURNING source_id`, account, a.namespace, a.scope, a.value, root, a.field).Scan(&id)
+		err := tx.QueryRowContext(ctx, `INSERT INTO source_ids(account_id,namespace,scope,value,`+col+`,evidence_field) VALUES(?,?,?,?,?,?) ON CONFLICT(account_id,namespace,value,scope) DO UPDATE SET `+col+`=excluded.`+col+` RETURNING source_id`, account, a.namespace, a.scope, a.value, root, a.field).Scan(&id)
 		if err != nil {
 			return 0, nil, err
 		}
@@ -252,4 +271,24 @@ func (s *Store) ResolveEntity(ctx context.Context, account, kind, ref string) (i
 }
 func EntityRef(r Record) string {
 	return fmt.Sprintf("igdm://accounts/%s/entities/%s/%d", r.Account, r.Table, r.Entity)
+}
+
+func duplicateIdentity(kind string, n *sourceNode) bool {
+	for _, field := range sourceColumns[kind] {
+		count := 0
+		for _, m := range n.members {
+			if m.key == field {
+				count++
+			}
+		}
+		if count > 1 {
+			return true
+		}
+	}
+	return false
+}
+
+// ResolveEntityTx uses the same identity snapshot as the acquisition commit.
+func ResolveEntityTx(ctx context.Context, tx *sql.Tx, account, kind, ref string) (int64, error) {
+	return (&Store{readTx: tx}).ResolveEntity(ctx, account, kind, ref)
 }

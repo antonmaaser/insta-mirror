@@ -96,11 +96,7 @@ func (e *Engine) archive(ctx context.Context, raw []byte, spec pageSpec) error {
 		return errors.New("source did not provide an explicit pagination boundary")
 	}
 	now := time.Now().UnixMilli()
-	pageBytes := []byte{}
-	for _, edge := range page.Edges {
-		pageBytes = append(pageBytes, edge.Node...)
-		pageBytes = append(pageBytes, '\n')
-	}
+
 	var stalled, stale bool
 	err := e.archiveTransaction(ctx, func(tx *sql.Tx) error {
 		var prior store.State
@@ -108,7 +104,8 @@ func (e *Engine) archive(ctx context.Context, raw []byte, spec pageSpec) error {
 			return err
 		}
 		stale = prior.Revision != spec.Revision
-		state := store.State{Cursor: page.Info.EndCursor, Complete: !page.Info.HasNextPage, LastSuccess: now, PageHash: store.Hash(pageBytes), Revision: prior.Revision + 1, Generation: prior.Generation}
+		state := store.State{Cursor: page.Info.EndCursor, Complete: !page.Info.HasNextPage, LastSuccess: now, PageHash: "", Revision: prior.Revision + 1, Generation: prior.Generation}
+		state.Gaps = prior.Gaps
 		if spec.Scope == "head" {
 			state.Anchor, state.Target, state.Candidate = prior.Anchor, prior.Target, prior.Candidate
 			if spec.Start {
@@ -134,38 +131,50 @@ func (e *Engine) archive(ctx context.Context, raw []byte, spec pageSpec) error {
 				state.Candidate = ""
 			}
 		}
-		stalled = !state.Complete && (state.Cursor == "" || state.Cursor == spec.Previous || prior.PageHash == state.PageHash && prior.Cursor != state.Cursor)
-		if stalled {
-			state.Cursor = prior.Cursor
-			state.Error = "pagination cursor did not advance"
-			state.Gaps = []string{state.Error}
-		}
 
 		if spec.Messages {
 			if err := store.Put(ctx, tx, store.Record{Table: "threads", Account: e.Account, Raw: container, Thread: spec.ID, Origin: spec.Path, Context: spec.Scope + ":" + spec.ID + ":" + spec.Previous, Observed: now}); err != nil {
 				return err
 			}
 		} else {
+			if err := store.Put(ctx, tx, store.Record{Table: "mailbox_pages", Account: e.Account, Raw: source, Origin: spec.Path, Context: spec.Scope + ":" + spec.ID + ":" + spec.Previous, Observed: now}); err != nil {
+				return err
+			}
 			for _, edge := range page.Edges {
-				t := field(edge.Node, "as_ig_direct_thread")
-				if !object(t) {
-					continue
+				if !object(field(edge.Node, "as_ig_direct_thread")) && len(state.Gaps) == 0 {
+					state.Gaps = []string{"inaccessible thread source retained; conversation content coverage is unknown"}
 				}
-				if err := e.thread(ctx, tx, t, spec.Path, spec.Scope+":"+spec.ID, now); err != nil {
+			}
+		}
+
+		// Resolve page members after normalization has established their aliases.
+		// Different source ID fields and rotating URLs cannot hide a repeated page.
+		pageKeys := []byte{}
+		for _, edge := range page.Edges {
+			node, kind := edge.Node, "messages"
+			if !spec.Messages {
+				node = field(edge.Node, "as_ig_direct_thread")
+				kind = "threads"
+			}
+			key := "unresolved:" + store.Hash(edge.Node)
+			ref := store.Identity(kind, node)
+			if ref != "" {
+				entity, err := store.ResolveEntityTx(ctx, tx, e.Account, kind, ref)
+				if err == nil {
+					key = fmt.Sprintf("%s:%d", kind, entity)
+				} else if !errors.Is(err, sql.ErrNoRows) {
 					return err
 				}
 			}
-			var pinned []json.RawMessage
-			if err := json.Unmarshal(field(container, "pinned_threads_v2"), &pinned); err == nil {
-				for _, p := range pinned {
-					t := field(p, "as_ig_direct_thread")
-					if object(t) {
-						if err := e.thread(ctx, tx, t, spec.Path, spec.Scope+":"+spec.ID, now); err != nil {
-							return err
-						}
-					}
-				}
-			}
+			pageKeys = append(pageKeys, key...)
+			pageKeys = append(pageKeys, 0)
+		}
+		state.PageHash = store.Hash(pageKeys)
+		stalled = !state.Complete && (state.Cursor == "" || state.Cursor == spec.Previous || prior.PageHash == state.PageHash && prior.Cursor != state.Cursor)
+		if stalled {
+			state.Cursor = prior.Cursor
+			state.Error = "pagination cursor did not advance"
+			state.Gaps = []string{state.Error}
 		}
 		if spec.Path == "get_slide_mailbox_for_iris_subscription" {
 			var checkpoint, resnapshot store.State
@@ -198,7 +207,7 @@ func (e *Engine) archive(ctx context.Context, raw []byte, spec pageSpec) error {
 				tail.Cursor = page.Info.EndCursor
 				tail.Complete = !page.Info.HasNextPage
 				tail.LastSuccess = now
-				tail.PageHash = store.Hash(pageBytes)
+				tail.PageHash = state.PageHash
 				tail.Revision++
 				if err := store.SaveState(ctx, tx, e.Account, "thread", spec.ID, tail); err != nil {
 					return err
@@ -221,9 +230,6 @@ func (e *Engine) archive(ctx context.Context, raw []byte, spec pageSpec) error {
 		return errors.New("pagination cursor did not advance")
 	}
 	return nil
-}
-func (e *Engine) thread(ctx context.Context, tx *sql.Tx, raw json.RawMessage, origin, contextID string, now int64) error {
-	return store.Put(ctx, tx, store.Record{Table: "threads", Account: e.Account, Raw: raw, Origin: origin, Context: contextID, Observed: now})
 }
 func pause(ctx context.Context, d time.Duration) error {
 	t := time.NewTimer(d)
@@ -331,6 +337,9 @@ func (e *Engine) History(ctx context.Context) error {
 			if err = e.DB.State(ctx, e.Account, "folder", folder, &state); err != nil {
 				return err
 			}
+		}
+		if len(state.Gaps) > 0 {
+			folderErrors = append(folderErrors, folder+": source availability boundaries retained; see folder state")
 		}
 	}
 	rows, err := e.DB.DB.QueryContext(ctx, `SELECT DISTINCT value FROM source_ids WHERE account_id=? AND namespace='thread.fbid'`, e.Account)

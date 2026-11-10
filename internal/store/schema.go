@@ -21,7 +21,7 @@ func createSchema(tx *sql.Tx) error {
  version_id INTEGER PRIMARY KEY, account_id TEXT NOT NULL, kind TEXT NOT NULL,
  user_entity_id INTEGER, thread_entity_id INTEGER, message_entity_id INTEGER,
  content_hash TEXT NOT NULL, residual TEXT NOT NULL CHECK(json_valid(residual)),
- identity_error TEXT NOT NULL DEFAULT '',
+ source_error TEXT NOT NULL DEFAULT '',
  CHECK((user_entity_id IS NOT NULL)+(thread_entity_id IS NOT NULL)+(message_entity_id IS NOT NULL)<=1),
  CHECK(user_entity_id IS NULL OR kind='users'), CHECK(thread_entity_id IS NULL OR kind='threads'), CHECK(message_entity_id IS NULL OR kind='messages'),
  UNIQUE(account_id,kind,content_hash), UNIQUE(account_id,version_id),
@@ -33,17 +33,18 @@ func createSchema(tx *sql.Tx) error {
  user_entity_id INTEGER, thread_entity_id INTEGER, message_entity_id INTEGER,
  evidence_version_id INTEGER, evidence_field TEXT NOT NULL DEFAULT '',
  CHECK((user_entity_id IS NOT NULL)+(thread_entity_id IS NOT NULL)+(message_entity_id IS NOT NULL)=1),
- UNIQUE(account_id,namespace,scope,value), UNIQUE(account_id,source_id),
+ UNIQUE(account_id,namespace,value,scope), UNIQUE(account_id,source_id),
  FOREIGN KEY(account_id,user_entity_id) REFERENCES users(account_id,entity_id),
  FOREIGN KEY(account_id,thread_entity_id) REFERENCES threads(account_id,entity_id),
  FOREIGN KEY(account_id,message_entity_id) REFERENCES messages(account_id,entity_id),
  FOREIGN KEY(account_id,evidence_version_id) REFERENCES source_versions(account_id,version_id));
- CREATE INDEX ids_user ON source_ids(account_id,user_entity_id,namespace);
- CREATE INDEX ids_thread ON source_ids(account_id,thread_entity_id,namespace);
- CREATE INDEX ids_message ON source_ids(account_id,message_entity_id,namespace);
- CREATE INDEX versions_user ON source_versions(account_id,user_entity_id);
- CREATE INDEX versions_thread ON source_versions(account_id,thread_entity_id);
- CREATE INDEX versions_message ON source_versions(account_id,message_entity_id);
+ CREATE INDEX ids_user ON source_ids(account_id,user_entity_id,namespace) WHERE user_entity_id IS NOT NULL;
+ CREATE INDEX ids_thread ON source_ids(account_id,thread_entity_id,namespace) WHERE thread_entity_id IS NOT NULL;
+ CREATE INDEX ids_message ON source_ids(account_id,message_entity_id,namespace) WHERE message_entity_id IS NOT NULL;
+ CREATE INDEX versions_user ON source_versions(account_id,user_entity_id) WHERE user_entity_id IS NOT NULL;
+ CREATE INDEX versions_thread ON source_versions(account_id,thread_entity_id) WHERE thread_entity_id IS NOT NULL;
+ CREATE INDEX versions_message ON source_versions(account_id,message_entity_id) WHERE message_entity_id IS NOT NULL;
+ CREATE INDEX versions_kind ON source_versions(account_id,kind,version_id);
  CREATE TABLE source_relations (
  account_id TEXT NOT NULL, parent_id INTEGER NOT NULL,
  path TEXT NOT NULL CHECK(json_valid(path)), field TEXT NOT NULL,
@@ -81,7 +82,7 @@ func createSchema(tx *sql.Tx) error {
 	if err != nil {
 		return err
 	}
-	for kind, fields := range indexedFields {
+	for kind, fields := range sourceFields {
 		owner := "0"
 		if kind != "deltas" {
 			col := ownerColumn(kind)
@@ -97,9 +98,6 @@ func createSchema(tx *sql.Tx) error {
 		for _, field := range fields {
 			expr := scalarSQL("v.residual", field)
 			query += `,` + expr + ` AS ` + field
-			if _, err = tx.Exec(`CREATE INDEX versions_` + kind + `_` + field + ` ON source_versions(account_id,` + scalarSQL("residual", field) + `) WHERE kind='` + kind + `'`); err != nil {
-				return err
-			}
 		}
 		if kind == "messages" {
 			content := childResidual("v.version_id", "content")
@@ -116,11 +114,37 @@ func createSchema(tx *sql.Tx) error {
 			return err
 		}
 	}
+	for kind, field := range map[string]string{"messages": "timestamp_ms", "deltas": "uq_seq_id"} {
+		if _, err = tx.Exec(`CREATE INDEX versions_` + field + ` ON source_versions(account_id,CAST(` + scalarSQL("residual", field) + ` AS INTEGER)) WHERE kind='` + kind + `'`); err != nil {
+			return err
+		}
+	}
+	_, err = tx.Exec(`
+ CREATE VIEW message_threads AS
+ SELECT v.account_id,v.entity_id AS message_entity_id,v.version_id AS message_version_id,i.thread_entity_id
+ FROM messages_versions v JOIN source_relations r ON r.parent_id=v.version_id AND r.field='thread_fbid' JOIN source_ids i ON i.source_id=r.source_id
+ UNION
+ SELECT t.account_id,m.entity_id,m.version_id,t.entity_id FROM threads_versions t JOIN source_relations r ON r.parent_id=t.version_id AND r.field='slide_messages.edges.node' JOIN messages_versions m ON m.version_id=r.child_id
+ WHERE NOT EXISTS(SELECT 1 FROM source_relations direct WHERE direct.parent_id=m.version_id AND direct.field='thread_fbid')
+ UNION
+ SELECT d.account_id,m.entity_id,m.version_id,i.thread_entity_id FROM deltas_versions d JOIN source_relations r ON r.parent_id=d.version_id AND r.field='message' JOIN messages_versions m ON m.version_id=r.child_id
+ JOIN source_relations tr ON tr.parent_id=d.version_id AND tr.field='thread_fbid' JOIN source_ids i ON i.source_id=tr.source_id
+ WHERE NOT EXISTS(SELECT 1 FROM source_relations direct WHERE direct.parent_id=m.version_id AND direct.field='thread_fbid');
+ CREATE VIEW message_senders AS SELECT DISTINCT v.account_id,v.entity_id AS message_entity_id,v.version_id AS message_version_id,i.user_entity_id
+ FROM messages_versions v JOIN source_relations r ON r.parent_id=v.version_id AND r.field IN ('sender_fbid','sender.id','sender.igid') JOIN source_ids i ON i.source_id=r.source_id;
+ CREATE VIEW delta_messages AS SELECT d.account_id,d.version_id,i.message_entity_id FROM deltas_versions d JOIN source_relations r ON r.parent_id=d.version_id AND r.field='message_id' JOIN source_ids i ON i.source_id=r.source_id
+ UNION SELECT d.account_id,d.version_id,m.entity_id FROM deltas_versions d JOIN source_relations r ON r.parent_id=d.version_id AND r.field='message' JOIN messages_versions m ON m.version_id=r.child_id;
+ CREATE VIEW delta_threads AS SELECT d.account_id,d.version_id,i.thread_entity_id FROM deltas_versions d JOIN source_relations r ON r.parent_id=d.version_id AND r.field='thread_fbid' JOIN source_ids i ON i.source_id=r.source_id
+ UNION SELECT d.account_id,d.version_id,t.thread_entity_id FROM deltas_versions d JOIN source_relations r ON r.parent_id=d.version_id AND r.field='message' JOIN messages_versions m ON m.version_id=r.child_id JOIN message_threads t ON t.account_id=m.account_id AND t.message_version_id=m.version_id;
+ `)
+	if err != nil {
+		return err
+	}
 	_, err = tx.Exec(fmt.Sprintf("PRAGMA user_version=%d", schemaVersion))
 	return err
 }
 
-var indexedFields = map[string][]string{
+var sourceFields = map[string][]string{
 	"threads":  {"id", "thread_id", "thread_fbid", "thread_key", "thread_subtype", "system_folder", "last_activity_timestamp_ms", "thread_title"},
 	"messages": {"id", "message_id", "thread_fbid", "sender_fbid", "timestamp_ms", "replied_to_message_id", "offline_threading_id", "text_body", "igd_snippet"},
 	"users":    {"id", "pk", "fbid_v2", "interop_messaging_user_fbid", "username", "full_name"},

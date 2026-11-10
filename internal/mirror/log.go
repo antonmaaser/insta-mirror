@@ -88,8 +88,8 @@ func (l *syncLog) save() error {
 }
 
 type createdItem struct {
-	kind, account, origin string
-	rowID                 int64
+	kind, account string
+	rowID         int64
 }
 
 func (l *syncLog) created(items []createdItem) {

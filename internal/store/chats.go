@@ -3,7 +3,6 @@ package store
 import (
 	"context"
 	"encoding/json"
-	"strings"
 )
 
 // ChatRow is a disposable overview of the latest source observations.
@@ -14,20 +13,15 @@ type ChatRow struct {
 }
 
 func (s *Store) Chats(ctx context.Context, account string) ([]ChatRow, error) {
-	rows, err := s.queryContext(ctx, `WITH t AS (
- SELECT *,row_number() OVER(PARTITION BY source_identity ORDER BY last_observed_at_ms DESC,record_id DESC) AS rank FROM threads_sources WHERE account_id=?
- ), m AS (
- SELECT *,row_number() OVER(PARTITION BY source_identity ORDER BY last_observed_at_ms DESC,record_id DESC) AS rank FROM messages_sources WHERE account_id=?
- ), refs AS (
- SELECT source_identity,id AS ref FROM threads_sources WHERE account_id=? AND id IS NOT NULL
- UNION SELECT source_identity,thread_fbid FROM threads_sources WHERE account_id=? AND thread_fbid IS NOT NULL
- ), matches AS (
- SELECT DISTINCT refs.source_identity AS chat,m.source_identity AS message,CAST(m.timestamp_ms AS INTEGER) AS stamp,(m.reaction_type='true') AS reaction
- FROM m JOIN refs ON (m.thread_fbid=refs.ref OR EXISTS (SELECT 1 FROM source_evidence ev JOIN source_observations a ON a.observation_id=ev.observation_id WHERE ev.version_id=m.record_id AND a.acquired_thread_id=refs.ref)) WHERE m.rank=1
- ), counts AS (
- SELECT chat,sum(CASE WHEN reaction=1 THEN 0 ELSE 1 END) AS count,max(stamp) AS stamp FROM matches GROUP BY chat
- ) SELECT t.source_identity,coalesce(t.thread_title,''),t.record_id,coalesce(counts.count,0),max(coalesce(CAST(t.last_activity_timestamp_ms AS INTEGER),0),coalesce(counts.stamp,0)) AS activity
- FROM t LEFT JOIN counts ON counts.chat=t.source_identity WHERE t.rank=1 ORDER BY activity DESC,t.source_identity`, account, account, account, account)
+	var top int64
+	if err := s.queryRowContext(ctx, `SELECT coalesce(max(observation_id),0) FROM source_observations WHERE account_id=?`, account).Scan(&top); err != nil {
+		return nil, err
+	}
+	rows, err := s.queryContext(ctx, evidenceCTE+`, tc AS (`+sourceSelection("threads")+`),mc AS (`+sourceSelection("messages")+`),
+ t AS (SELECT *,row_number() OVER(PARTITION BY entity_id ORDER BY `+rankOrder("threads")+`) AS rank FROM tc),
+ m AS (SELECT *,row_number() OVER(PARTITION BY entity_id ORDER BY `+rankOrder("messages")+`) AS rank FROM mc),
+ counts AS (SELECT mt.thread_entity_id,count(DISTINCT CASE WHEN coalesce(m.reaction_type,'false')!='true' THEN m.entity_id END) AS count,max(CAST(m.timestamp_ms AS INTEGER)) AS stamp FROM m JOIN message_threads mt ON mt.account_id=m.account_id AND mt.message_version_id=m.version_id WHERE m.rank=1 GROUP BY mt.thread_entity_id)
+ SELECT t.source_identity,coalesce((SELECT tc.thread_title FROM tc WHERE tc.entity_id=t.entity_id AND json_type(tc.residual,'$.thread_title') IS NOT NULL ORDER BY tc.observation_id DESC,tc.version_id DESC LIMIT 1),''),t.record_id,coalesce(c.count,0),max(coalesce(CAST(t.last_activity_timestamp_ms AS INTEGER),0),coalesce(c.stamp,0)) AS activity FROM t LEFT JOIN counts c ON c.thread_entity_id=t.entity_id WHERE t.rank=1 ORDER BY activity DESC,t.entity_id`, account, top)
 	if err != nil {
 		return nil, err
 	}
@@ -48,12 +42,18 @@ func (s *Store) Chats(ctx context.Context, account string) ([]ChatRow, error) {
 	}
 	rows.Close()
 	for i, id := range recordIDs {
-		record, err := s.Record(ctx, account, "threads", id)
+		var raw []byte
+		var err error
+		if s.readTx != nil {
+			raw, err = reconstruct(ctx, s.readTx, account, id)
+		} else {
+			raw, err = reconstruct(ctx, s.DB, account, id)
+		}
 		if err != nil {
 			return nil, err
 		}
 		var fields map[string]json.RawMessage
-		if err = json.Unmarshal(record.Raw, &fields); err != nil {
+		if err = json.Unmarshal(raw, &fields); err != nil {
 			return nil, err
 		}
 		out[i].Users = fields["users"]
@@ -67,16 +67,20 @@ func (s *Store) Chats(ctx context.Context, account string) ([]ChatRow, error) {
 // ReactionLogLinks retains the provider's unqualified message identifiers;
 // projection resolves them only when the matching source observation is unique.
 func (s *Store) ReactionLogLinks(ctx context.Context, account, thread string) (map[string][]string, error) {
-	refs, err := s.ThreadReferences(ctx, account, thread)
+	entity, err := s.ResolveEntity(ctx, account, "threads", thread)
 	if err != nil {
 		return nil, err
 	}
-	args := []any{account}
-	for _, ref := range refs {
-		args = append(args, ref)
-	}
-	marks := strings.TrimSuffix(strings.Repeat("?,", len(refs)), ",")
-	rows, err := s.queryContext(ctx, `SELECT DISTINCT reaction_log_message_id,message_id FROM deltas_sources WHERE account_id=? AND thread_fbid IN (`+marks+`) AND __typename IN ('SlideUQPPCreateReaction','SlideUQPPDeleteReaction') AND reaction_log_message_id IS NOT NULL AND message_id IS NOT NULL`, args...)
+	rows, err := s.queryContext(ctx, `SELECT DISTINCT log.value,target.value FROM deltas_versions d
+ JOIN delta_threads dt ON dt.version_id=d.version_id AND dt.thread_entity_id=?
+ JOIN source_relations reaction ON reaction.parent_id=d.version_id AND reaction.field='reaction'
+ JOIN source_relations logref ON logref.parent_id=reaction.child_id AND logref.field='log_message_id'
+ JOIN source_ids lid ON lid.source_id=logref.source_id
+ JOIN source_relations targetref ON targetref.parent_id=d.version_id AND targetref.field='message_id'
+ JOIN source_ids tid ON tid.source_id=targetref.source_id
+ JOIN source_ids log ON log.account_id=d.account_id AND log.message_entity_id=lid.message_entity_id AND log.namespace='message.mid'
+ JOIN source_ids target ON target.account_id=d.account_id AND target.message_entity_id=tid.message_entity_id AND target.namespace='message.mid'
+ WHERE d.account_id=? AND d.__typename IN ('SlideUQPPCreateReaction','SlideUQPPDeleteReaction')`, entity, account)
 	if err != nil {
 		return nil, err
 	}

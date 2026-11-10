@@ -26,6 +26,24 @@ func WriteTranscript(ctx context.Context, db *store.Store, chat store.Record, w 
 		if user == nil || user.InteropMessagingUserFBID == 0 {
 			continue
 		}
+		profile, err := db.Query(ctx, "users", store.Query{Account: chat.Account, SourceID: "interop_messaging_user_fbid:" + strconv.FormatInt(user.InteropMessagingUserFBID, 10), Limit: 1})
+		if err != nil {
+			return err
+		}
+		if len(profile.Records) > 0 {
+			fields, _, err := CurrentFields(ctx, db, profile.Records[0])
+			if err != nil {
+				return err
+			}
+			raw, err := json.Marshal(fields)
+			if err != nil {
+				return err
+			}
+			var latest slidetypes.User
+			if json.Unmarshal(raw, &latest) == nil {
+				user = &latest
+			}
+		}
 		name := user.FullName
 		if name == "" {
 			name = user.Username
@@ -55,7 +73,7 @@ func WriteTranscript(ctx context.Context, db *store.Store, chat store.Record, w 
 	if decodeErr != nil {
 		fmt.Fprintln(&header, "Thread interpretation is partial; the source record remains available.")
 	}
-	fmt.Fprint(&header, "\nThis is the local archive at one read snapshot, not a claim of complete Instagram history.\nMessages use source timestamps; ties use local record order. Missing timestamps are listed last.\nReaction events are grouped beneath their source-linked message, regardless of reaction time.\nNames come from the retained thread observation. Updates are applied only where source ordering is established.\n")
+	fmt.Fprint(&header, "\nThis is the local archive at one read snapshot, not a claim of complete Instagram history.\nMessages use source timestamps; ties use local record order. Missing timestamps are listed last.\nReaction events are grouped beneath their source-linked message, regardless of reaction time.\nNames use locally observed profiles. Updates are applied only where source ordering is established.\n")
 	if _, err := io.WriteString(w, header.String()); err != nil {
 		return err
 	}
@@ -123,7 +141,7 @@ func transcriptMessage(result Result, names map[string]string) string {
 	if message.SenderFBID == 0 {
 		senderID = "unavailable"
 	}
-	if message.Sender != nil && message.Sender.Name != "" {
+	if name == "" && message.Sender != nil && message.Sender.Name != "" {
 		name = message.Sender.Name
 	}
 	if name == "" {

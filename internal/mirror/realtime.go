@@ -3,6 +3,7 @@ package mirror
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -242,9 +243,9 @@ func (e *Engine) Follow(ctx context.Context) error {
 }
 
 func (e *Engine) unparsedBatch(ctx context.Context, b []byte) error {
-	raw, _ := json.Marshal(map[string]string{"unparseable_delta_batch": string(b)})
+	raw, _ := json.Marshal(map[string]string{"unparseable_delta_batch_encoding": "base64", "unparseable_delta_batch": base64.StdEncoding.EncodeToString(b)})
 	err := e.archiveTransaction(ctx, func(tx *sql.Tx) error {
-		if err := store.Put(ctx, tx, store.Record{Table: "deltas", Account: e.Account, Identity: "unparsed:" + store.Hash(b), Origin: "dgw-unparsed", Hash: store.Hash(b), Raw: raw}); err != nil {
+		if err := store.Put(ctx, tx, store.Record{Table: "deltas", Account: e.Account, Identity: fmt.Sprintf("unparsed:%s:%d", store.Hash(b), time.Now().UnixNano()), Origin: "dgw-unparsed", Hash: store.Hash(b), Raw: raw}); err != nil {
 			return err
 		}
 		return store.SaveState(ctx, tx, e.Account, "realtime", "gap", store.State{Error: "unparseable realtime batch; original bytes retained, checkpoint unchanged"})

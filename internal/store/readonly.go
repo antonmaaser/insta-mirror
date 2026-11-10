@@ -7,7 +7,6 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"strings"
 )
 
 // OpenReadOnly reads the live SQLite database, including its WAL. It does not
@@ -47,6 +46,9 @@ func OpenReadOnly(ctx context.Context, path string) (*Store, error) {
 // ReadSnapshot keeps all source, delta, media and coverage reads on the same
 // deferred read transaction. WAL writers can continue committing independently.
 func (s *Store) ReadSnapshot(ctx context.Context, fn func(*Store) error) error {
+	if s.readTx != nil {
+		return fn(s)
+	}
 	tx, err := s.DB.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return err
@@ -92,25 +94,22 @@ func (s *Store) TranscriptMessages(ctx context.Context, account, thread string, 
 	if s.readTx == nil {
 		return fmt.Errorf("transcript requires a read snapshot")
 	}
-	refs, err := s.ThreadReferences(ctx, account, thread)
+	entity, err := s.ResolveEntity(ctx, account, "threads", thread)
 	if err != nil {
 		return err
 	}
-	marks := strings.TrimSuffix(strings.Repeat("?,", len(refs)), ",")
-	args := []any{account}
-	for range 2 {
-		for _, ref := range refs {
-			args = append(args, ref)
-		}
+	var top int64
+	if err = s.queryRowContext(ctx, `SELECT coalesce(max(observation_id),0) FROM source_observations WHERE account_id=?`, account).Scan(&top); err != nil {
+		return err
 	}
-	rows, err := s.queryContext(ctx, `WITH ranked AS (SELECT *,row_number() OVER(PARTITION BY source_identity ORDER BY last_observed_at_ms DESC,record_id DESC) AS rank FROM messages_sources WHERE account_id=?) SELECT record_id,source_identity,acquired_thread_id,origin,observed_at_ms,last_observed_at_ms,source_hash,version_id,content_hash FROM ranked WHERE rank=1 AND (thread_fbid IN (`+marks+`) OR EXISTS (SELECT 1 FROM source_evidence ev JOIN source_observations a ON a.observation_id=ev.observation_id WHERE ev.version_id=ranked.record_id AND a.acquired_thread_id IN (`+marks+`))) ORDER BY (timestamp_ms IS NULL OR timestamp_ms=''),CAST(timestamp_ms AS INTEGER),record_id`, args...)
+	rows, err := s.queryContext(ctx, sourceCTE("messages")+`, ranked AS (SELECT *,row_number() OVER(PARTITION BY entity_id ORDER BY `+rankOrder("messages")+`) AS rank FROM candidates) SELECT `+recordColumns+` FROM ranked WHERE rank=1 AND EXISTS(SELECT 1 FROM message_threads mt WHERE mt.account_id=ranked.account_id AND mt.message_version_id=ranked.version_id AND mt.thread_entity_id=?) ORDER BY (timestamp_ms IS NULL OR timestamp_ms=''),CAST(timestamp_ms AS INTEGER),entity_id`, account, top, entity)
 	if err != nil {
 		return err
 	}
 	defer rows.Close()
 	for rows.Next() {
-		r := Record{Table: "messages", Account: account}
-		if err = rows.Scan(&r.RowID, &r.Identity, &r.Thread, &r.Origin, &r.Observed, &r.LastObserved, &r.Hash, &r.Version, &r.ContentHash); err != nil {
+		r := Record{Table: "messages", watermark: top}
+		if err = scanRecord(rows, &r); err != nil {
 			return err
 		}
 		if err = s.hydrate(ctx, &r); err != nil {

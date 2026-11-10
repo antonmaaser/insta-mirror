@@ -8,6 +8,7 @@ import (
 	"errors"
 	"math/big"
 	"sort"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 )
@@ -246,63 +247,110 @@ func joinField(parent, field string) string {
 	return parent + "." + field
 }
 
-func extractedKind(owner, field string) string {
-	switch field {
-	case "users", "viewer", "user_dict", "usersWithoutViewer", "group_creator":
-		if owner == "threads" || owner == "messages" || owner == "deltas" {
+func extractedKind(owner, field, path string) string {
+	if path != field && !(owner == "threads" && path == "slide_messages.edges.node") && !(owner == "messages" && path == "sender.user_dict") && !(owner == "deltas" && path == "thread.as_ig_direct_thread") && !(owner == "mailbox_pages" && (path == "threads_by_folder.edges.node.as_ig_direct_thread" || path == "pinned_threads_v2.as_ig_direct_thread")) {
+		return ""
+	}
+	switch owner {
+	case "mailbox_pages":
+		if field == "as_ig_direct_thread" {
+			return "threads"
+		}
+	case "threads":
+		switch field {
+		case "users", "viewer", "usersWithoutViewer", "group_creator":
 			return "users"
-		}
-	case "message", "replied_to_message", "pinned_messages":
-		if owner == "messages" || owner == "deltas" || owner == "threads" {
+		case "node", "pinned_messages":
 			return "messages"
+		case "slide_read_receipts":
+			return "read_receipts"
+		case "nicknames":
+			return "nicknames"
 		}
-	case "node":
-		if owner == "threads" {
+	case "messages":
+		switch field {
+		case "user_dict":
+			if path == "sender.user_dict" {
+				return "users"
+			}
+		case "replied_to_message":
 			return "messages"
-		}
-	case "as_ig_direct_thread":
-		return "threads"
-	case "content":
-		if owner == "messages" {
+		case "content":
 			return "content"
+		case "reactions":
+			return "reactions"
+		case "mentions":
+			return "mentions"
+		case "slide_edit_history":
+			return "edit_history"
+		}
+	case "deltas":
+		switch field {
+		case "message":
+			return "messages"
+		case "reaction":
+			return "reactions"
+		case "read_receipt":
+			return "read_receipts"
+		case "as_ig_direct_thread":
+			return "threads"
+		}
+	case "content":
+		switch field {
+		case "xma":
+			return "xma"
+		case "attachments", "attachment", "videos", "ordered_photo_video_attachments", "audio_attachments", "animated_media":
+			return "attachments"
 		}
 	case "xma":
-		if owner == "content" {
-			return "xma"
-		}
-	case "attachments", "attachment", "videos", "ordered_photo_video_attachments", "audio_attachments", "animated_media":
-		return "attachments"
-	case "reactions", "reaction", "msg_reactions":
-		return "reactions"
-	case "mentions":
-		return "mentions"
-	case "slide_edit_history":
-		return "edit_history"
-	case "slide_read_receipts", "read_receipt":
-		return "read_receipts"
-	case "nicknames":
-		return "nicknames"
-	case "preview_image", "xmaPreviewImage", "header_icon":
-		if owner == "content" || owner == "xma" {
+		switch field {
+		case "preview_image", "xmaPreviewImage", "header_icon":
 			return "media_descriptors"
+		case "cta_buttons":
+			return "cta_buttons"
 		}
 	}
 	return ""
 }
 func referenceKind(owner, field string, n *sourceNode) (string, string) {
-	switch field {
-	case "thread_fbid":
-		return "threads", "thread_fbid"
-	case "sender_fbid", "participant_fbid", "actor_fbid", "left_participant_fbid", "viewer_fbid", "eimu_id":
-		return "users", field
-	case "replied_to_message_id", "log_message_id":
-		return "messages", field
-	case "message_id":
-		if owner == "deltas" {
+	switch owner {
+	case "messages":
+		switch field {
+		case "thread_fbid":
+			return "threads", field
+		case "sender_fbid":
+			return "users", field
+		case "replied_to_message_id":
 			return "messages", field
 		}
-	case "user_fbid":
-		if nodeValue(n, "profile_range_type") == "PROFILE" {
+	case "deltas":
+		switch field {
+		case "thread_fbid":
+			return "threads", field
+		case "message_id":
+			return "messages", field
+		case "actor_fbid", "left_participant_fbid", "viewer_fbid":
+			return "users", field
+		}
+	case "reactions":
+		switch field {
+		case "sender_fbid":
+			return "users", field
+		case "log_message_id":
+			return "messages", field
+		}
+	case "read_receipts":
+		if field == "participant_fbid" {
+			return "users", field
+		}
+	case "nicknames":
+		if field == "eimu_id" {
+			return "users", field
+		} else if field == "igid" {
+			return "users", "id"
+		}
+	case "mentions":
+		if field == "user_fbid" && nodeValue(n, "profile_range_type") == "PROFILE" {
 			return "users", "sender_fbid"
 		}
 	}
@@ -327,11 +375,21 @@ func putVersion(ctx context.Context, tx *sql.Tx, account, kind string, n *source
 	if !errors.Is(err, sql.ErrNoRows) {
 		return 0, err
 	}
+	err = nil
 	var owner int64
 	var ownIDs []int64
 	identityError := ""
+
 	if ownerColumn(kind) != "" {
-		owner, ownIDs, err = resolveAliases(ctx, tx, account, kind, aliases(kind, n))
+		if duplicateIdentity(kind, n) {
+			identityError = "duplicate source identity fields; content retained without unification"
+		} else {
+			sourceAliases := aliases(kind, n)
+			if len(sourceAliases) == 0 {
+				identityError = "source object has no usable identity; content retained without entity assignment"
+			}
+			owner, ownIDs, err = resolveAliases(ctx, tx, account, kind, sourceAliases)
+		}
 		if errors.Is(err, errIdentityConflict) {
 			identityError = err.Error()
 		} else if err != nil {
@@ -341,7 +399,7 @@ func putVersion(ctx context.Context, tx *sql.Tx, account, kind string, n *source
 	var links []sourceLink
 	var walk func(*sourceNode, []int, string, string) (*sourceNode, error)
 	walk = func(node *sourceNode, path []int, field, extract string) (*sourceNode, error) {
-		if node.shape == '{' && extract != "" {
+		if node.shape == '{' && extract != "" && len(node.members) > 0 {
 			child, err := putVersion(ctx, tx, account, extract, node)
 			if err != nil {
 				return nil, err
@@ -376,19 +434,23 @@ func putVersion(ctx context.Context, tx *sql.Tx, account, kind string, n *source
 				}
 			}
 			for i, m := range node.members {
+				if kind == "mailbox_pages" && m.key == "as_ig_direct_thread" && string(m.value.scalar) == "null" && extractedKind(kind, m.key, joinField(field, m.key)) == "threads" {
+					identityError = "thread source unavailable; source boundary retained without assuming an empty conversation"
+				}
+
 				p := pathAppend(path, i)
 				f := joinField(field, m.key)
-				extractKind := extractedKind(kind, m.key)
-				if m.key == "node" && f != "slide_messages.edges.node" {
-					extractKind = ""
-				}
+				extractKind := extractedKind(kind, m.key, f)
 				child, err := walk(m.value, p, f, extractKind)
 				if err != nil {
 					return nil, err
 				}
 				residual.members = append(residual.members, sourceMember{key: m.key, encodedKey: m.encodedKey, value: child})
 				if m.value.shape == 0 {
-					rk, rf := referenceKind(kind, m.key, node)
+					rk, rf := "", ""
+					if field == "" {
+						rk, rf = referenceKind(kind, m.key, node)
+					}
 					if field == "sender" {
 						if m.key == "id" {
 							rk, rf = "users", "sender_fbid"
@@ -415,6 +477,24 @@ func putVersion(ctx context.Context, tx *sql.Tx, account, kind string, n *source
 					return nil, err
 				}
 				residual.elements = append(residual.elements, child)
+				if value := nodeID(v); value != "" {
+					rk, rf := "", ""
+					if kind == "threads" || kind == "deltas" {
+						switch field {
+						case "admin_user_ids", "admin_igids":
+							rk, rf = "users", "id"
+						case "pinned_messages", "unpinned_messages":
+							rk, rf = "messages", "id"
+						}
+					}
+					if rk != "" {
+						_, ids, err := resolveAliases(ctx, tx, account, rk, []sourceAlias{{namespace: identifierNamespace(rk, rf), value: value, field: field}})
+						if err != nil {
+							return nil, err
+						}
+						links = append(links, sourceLink{path: pathAppend(path, i), field: field, source: ids[0]})
+					}
+				}
 			}
 		}
 		return residual, nil
@@ -438,7 +518,7 @@ func putVersion(ctx context.Context, tx *sql.Tx, account, kind string, n *source
 			m = owner
 		}
 	}
-	result, err := tx.ExecContext(ctx, `INSERT INTO source_versions(account_id,kind,user_entity_id,thread_entity_id,message_entity_id,content_hash,residual,identity_error) VALUES(?,?,?,?,?,?,?,?)`, account, kind, u, t, m, fingerprint, string(residual.bytes()), identityError)
+	result, err := tx.ExecContext(ctx, `INSERT INTO source_versions(account_id,kind,user_entity_id,thread_entity_id,message_entity_id,content_hash,residual,source_error) VALUES(?,?,?,?,?,?,?,?)`, account, kind, u, t, m, fingerprint, string(residual.bytes()), identityError)
 	if err != nil {
 		return 0, err
 	}
@@ -574,27 +654,48 @@ func (s *Store) hydrate(ctx context.Context, r *Record) error {
 		return err
 	}
 	r.Representation = "reconstructed_source"
+	r.HashScope = "acquisition_root"
 	if ownerColumn(r.Table) != "" {
 		if err = s.queryRowContext(ctx, `SELECT entity_id FROM `+r.Table+`_versions WHERE account_id=? AND version_id=?`, r.Account, r.Version).Scan(&r.Entity); err != nil {
 			return err
 		}
 		r.EntityReference = EntityRef(*r)
 	}
-	rows, err := s.queryContext(ctx, `SELECT DISTINCT o.observation_id,o.origin,o.acquired_thread_id,o.source_hash,o.observed_at_ms,o.last_observed_at_ms FROM source_evidence e JOIN source_observations o ON o.observation_id=e.observation_id WHERE e.account_id=? AND e.version_id=? AND (?=0 OR o.observation_id<=?) ORDER BY o.observation_id DESC LIMIT 33`, r.Account, r.Version, r.watermark, r.watermark)
+	rows, err := s.queryContext(ctx, `WITH RECURSIVE ancestors(id) AS (SELECT version_id FROM source_versions WHERE account_id=? AND version_id=? UNION SELECT r.parent_id FROM source_relations r JOIN ancestors a ON r.child_id=a.id) SELECT DISTINCT o.observation_id,o.version_id,root.kind,o.event_identity,o.origin,o.acquired_thread_id,o.source_hash,o.observed_at_ms,o.last_observed_at_ms FROM ancestors a JOIN source_observations o ON o.version_id=a.id JOIN source_versions root ON root.version_id=o.version_id WHERE o.account_id=? AND (?=0 OR o.observation_id<=?) ORDER BY o.observation_id DESC LIMIT 33`, r.Account, r.Version, r.Account, r.watermark, r.watermark)
 	if err != nil {
 		return err
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var a Acquisition
-		if err = rows.Scan(&a.ID, &a.Origin, &a.Thread, &a.Hash, &a.Observed, &a.LastObserved); err != nil {
+		if err = rows.Scan(&a.ID, &a.RootVersion, &a.RootKind, &a.Event, &a.Origin, &a.Thread, &a.Hash, &a.Observed, &a.LastObserved); err != nil {
 			return err
 		}
 		if len(r.Acquisitions) == 32 {
 			r.AcquisitionsTruncated = true
 			break
 		}
+		if a.ID == r.Observation {
+			if seq, ok := strings.CutPrefix(a.Event, "uq_seq_id:"); ok {
+				r.Sequence, _ = strconv.ParseInt(seq, 10, 64)
+			}
+		}
+		if a.RootKind == "mailbox_pages" {
+			a.ExcludedFields = []string{"__token"}
+		}
 		r.Acquisitions = append(r.Acquisitions, a)
 	}
 	return rows.Err()
+}
+
+// Subscription tokens are acquisition credentials, not archive content. Keep
+// the surrounding page, wrappers and ordered relationships without this field.
+func stripMailboxToken(node *sourceNode) {
+	members := node.members[:0]
+	for _, m := range node.members {
+		if m.key != "__token" {
+			members = append(members, m)
+		}
+	}
+	node.members = members
 }

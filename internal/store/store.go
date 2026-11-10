@@ -21,12 +21,15 @@ type Store struct {
 }
 
 type Record struct {
-	Table                 string `json:"kind"`
-	Entity                int64  `json:"entity_id,omitempty"`
-	EntityReference       string `json:"entity_reference,omitempty"`
-	Observation           int64  `json:"observation_id,omitempty"`
-	AcquisitionsTruncated bool   `json:"acquisitions_truncated,omitempty"`
-	Context               string `json:"-"`
+	Table                 string   `json:"kind"`
+	Entity                int64    `json:"entity_id,omitempty"`
+	EntityReference       string   `json:"entity_reference,omitempty"`
+	Sequence              int64    `json:"source_sequence,omitempty"`
+	Matches               []string `json:"matching_source_references,omitempty"`
+	HashScope             string   `json:"source_hash_scope"`
+	Observation           int64    `json:"observation_id,omitempty"`
+	AcquisitionsTruncated bool     `json:"acquisitions_truncated,omitempty"`
+	Context               string   `json:"-"`
 	watermark             int64
 	RowID                 int64           `json:"record_id"`
 	Account               string          `json:"account_id"`
@@ -45,12 +48,16 @@ type Record struct {
 
 // Acquisition identifies how a version was observed, independently of its content.
 type Acquisition struct {
-	ID           int64  `json:"observation_id"`
-	Origin       string `json:"origin"`
-	Thread       string `json:"acquired_thread_id,omitempty"`
-	Hash         string `json:"source_hash"`
-	Observed     int64  `json:"observed_at_ms"`
-	LastObserved int64  `json:"last_observed_at_ms"`
+	RootKind       string   `json:"root_kind"`
+	ExcludedFields []string `json:"excluded_fields,omitempty"`
+	RootVersion    int64    `json:"root_version_id"`
+	Event          string   `json:"event_identity,omitempty"`
+	ID             int64    `json:"observation_id"`
+	Origin         string   `json:"origin"`
+	Thread         string   `json:"acquired_thread_id,omitempty"`
+	Hash           string   `json:"source_hash"`
+	Observed       int64    `json:"observed_at_ms"`
+	LastObserved   int64    `json:"last_observed_at_ms"`
 }
 
 type State struct {
@@ -154,11 +161,20 @@ func String(raw json.RawMessage, key string) string {
 	}
 	return ""
 }
-func Identity(table string, raw json.RawMessage) string {
-	fields := map[string][]string{"threads": {"id", "thread_fbid", "thread_id", "thread_key"}, "messages": {"id", "message_id"}, "users": {"id", "pk", "fbid_v2", "interop_messaging_user_fbid"}, "deltas": {"uq_seq_id"}}
-	for _, key := range fields[table] {
-		if v := String(raw, key); v != "" && v != "0" {
-			return key + ":" + v
+func Identity(kind string, raw json.RawMessage) string {
+	node, err := parseSource(raw)
+	if err != nil {
+		return ""
+	}
+	if kind == "deltas" {
+		if value := nodeValue(node, "uq_seq_id"); value != "" {
+			return "uq_seq_id:" + value
+		}
+		return ""
+	}
+	for _, field := range sourceColumns[kind] {
+		if value := nodeValue(node, field); value != "" {
+			return field + ":" + value
 		}
 	}
 	return ""
@@ -168,12 +184,19 @@ func Hash(raw []byte) string { h := sha256.Sum256(raw); return hex.EncodeToStrin
 // Put archives one acquisition root. Embedded content inherits provenance via
 // source_relations, rather than allocating an observation for every descendant.
 func Put(ctx context.Context, tx *sql.Tx, r Record) error {
-	if r.Table != "threads" && r.Table != "messages" && r.Table != "users" && r.Table != "deltas" {
+	if r.Table != "threads" && r.Table != "messages" && r.Table != "users" && r.Table != "deltas" && r.Table != "mailbox_pages" {
 		return errors.New("invalid source table")
 	}
 	node, err := parseSource(r.Raw)
 	if err != nil || node.shape != '{' {
 		return errors.New("source must be a JSON object")
+	}
+	if r.Table == "mailbox_pages" {
+		if r.Hash == "" {
+			r.Hash = Hash(r.Raw)
+		}
+		stripMailboxToken(node)
+		r.Raw = node.bytes()
 	}
 	if r.Account == "" {
 		return errors.New("missing account identity")
@@ -293,7 +316,25 @@ func (s *Store) Status(ctx context.Context, account string) ([]map[string]any, e
 		}
 		out = append(out, map[string]any{"account_id": a, "scope": scope, "scope_id": id, "state": json.RawMessage(b)})
 	}
-	return out, rows.Err()
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return nil, err
+	}
+	failures, err := s.queryContext(ctx, `SELECT account_id,kind,version_id,source_error FROM source_versions WHERE source_error!='' AND (?='' OR account_id=?) ORDER BY version_id DESC LIMIT 20`, account, account)
+	if err != nil {
+		return nil, err
+	}
+	defer failures.Close()
+	for failures.Next() {
+		var r Record
+		var label string
+		if err = failures.Scan(&r.Account, &r.Table, &r.RowID, &label); err != nil {
+			return nil, err
+		}
+		out = append(out, map[string]any{"account_id": r.Account, "scope": "retained_source_boundary", "current_state": false, "error": label, "source_reference": SourceRef(r)})
+	}
+	return out, failures.Err()
 }
 
 // ReadState reads on the same transaction that stores observations/checkpoints.
