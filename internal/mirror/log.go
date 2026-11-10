@@ -99,11 +99,7 @@ func (l *syncLog) created(items []createdItem) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	for _, item := range items {
-		source := "history"
-		if strings.HasPrefix(item.origin, "dgw") {
-			source = "realtime"
-		}
-		line := fmt.Sprintf("%s created %s record=%d account=%q source=%s", time.Now().UTC().Format(time.RFC3339Nano), strings.TrimSuffix(item.kind, "s"), item.rowID, item.account, source)
+		line := fmt.Sprintf("%s stored %s version=%d account=%q", time.Now().UTC().Format(time.RFC3339Nano), strings.TrimSuffix(item.kind, "s"), item.rowID, item.account)
 		l.append(line)
 		fmt.Fprintln(os.Stderr, line)
 	}

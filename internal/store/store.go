@@ -54,6 +54,11 @@ type Acquisition struct {
 }
 
 type State struct {
+	Revision    int64    `json:"revision,omitempty"`
+	Anchor      string   `json:"anchor,omitempty"`
+	Target      string   `json:"target,omitempty"`
+	Candidate   string   `json:"candidate,omitempty"`
+	Generation  int64    `json:"generation,omitempty"`
 	PageHash    string   `json:"page_hash,omitempty"`
 	Cursor      string   `json:"cursor,omitempty"`
 	Complete    bool     `json:"complete"`
@@ -181,23 +186,27 @@ func Put(ctx context.Context, tx *sql.Tx, r Record) error {
 		return err
 	}
 	contextID := r.Context
-	if contextID == "" {
-		if col := ownerColumn(r.Table); col != "" {
-			var owner sql.NullInt64
-			if err = tx.QueryRowContext(ctx, `SELECT `+col+` FROM source_versions WHERE version_id=?`, version).Scan(&owner); err != nil {
+	if col := ownerColumn(r.Table); col != "" {
+		var owner sql.NullInt64
+		if err = tx.QueryRowContext(ctx, `SELECT `+col+` FROM source_versions WHERE version_id=?`, version).Scan(&owner); err != nil {
+			return err
+		}
+		if owner.Valid {
+			var canonical int64
+			if err = tx.QueryRowContext(ctx, `SELECT coalesce(merged_into,entity_id) FROM `+r.Table+` WHERE account_id=? AND entity_id=?`, r.Account, owner.Int64).Scan(&canonical); err != nil {
 				return err
 			}
-			contextID = fmt.Sprintf("%s:%d", r.Table, owner.Int64)
-			if !owner.Valid {
-				contextID = fmt.Sprintf("version:%d", version)
-			}
+			contextID += fmt.Sprintf(":%s:%d", r.Table, canonical)
 		} else {
-			contextID = r.Identity
-			if contextID == "" {
-				contextID = Identity(r.Table, r.Raw)
-			}
+			contextID += fmt.Sprintf(":version:%d", version)
+		}
+	} else if contextID == "" {
+		contextID = r.Identity
+		if contextID == "" {
+			contextID = Identity(r.Table, r.Raw)
 		}
 	}
+
 	event := ""
 	if r.Table == "deltas" {
 		event = r.Identity
@@ -205,7 +214,10 @@ func Put(ctx context.Context, tx *sql.Tx, r Record) error {
 			event = Identity("deltas", r.Raw)
 		}
 	}
-	hash := Hash(r.Raw)
+	hash := r.Hash
+	if hash == "" {
+		hash = Hash(r.Raw)
+	}
 	var previous, oldVersion int64
 	var oldHash string
 	if event != "" {
@@ -282,4 +294,17 @@ func (s *Store) Status(ctx context.Context, account string) ([]map[string]any, e
 		out = append(out, map[string]any{"account_id": a, "scope": scope, "scope_id": id, "state": json.RawMessage(b)})
 	}
 	return out, rows.Err()
+}
+
+// ReadState reads on the same transaction that stores observations/checkpoints.
+func ReadState(ctx context.Context, tx *sql.Tx, account, scope, id string, out any) error {
+	var raw string
+	err := tx.QueryRowContext(ctx, `SELECT state FROM sync_state WHERE account_id=? AND scope=? AND scope_id=?`, account, scope, id).Scan(&raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal([]byte(raw), out)
 }

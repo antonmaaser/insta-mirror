@@ -71,11 +71,18 @@ func (e *Engine) captureDeltas(ctx context.Context, b []byte) error {
 						label = "delta decoding failed; source content retained"
 						parseFailure = true
 					}
-					if err := store.SaveState(ctx, tx, e.Account, "realtime", "delta:"+identity, store.State{Error: label, SeqID: delta.UQSeqID}); err != nil {
+					if err := store.SaveState(ctx, tx, e.Account, "realtime", "interpretation", store.State{Error: label, SeqID: delta.UQSeqID}); err != nil {
 						return err
 					}
 				}
 			}
+		}
+		var conflict store.State
+		if err := store.ReadState(ctx, tx, e.Account, "realtime", "conflict", &conflict); err != nil {
+			return err
+		}
+		if conflict.Error != "" {
+			parseFailure = true
 		}
 		if !parseFailure && latest > 0 {
 			var prior store.State
@@ -151,7 +158,7 @@ func (e *Engine) event(ctx context.Context, event slidetypes.ClientEvent) error 
 		if err == nil {
 			err = e.DB.Transaction(ctx, func(tx *sql.Tx) error {
 				gap := store.State{SeqID: prior.SeqID, Timestamp: time.Now().UnixMilli(), Gaps: []string{"source requested resnapshot; intervening realtime deltas may be unavailable; snapshots are reconciled separately"}}
-				if err := store.SaveState(ctx, tx, e.Account, "reconciliation", fmt.Sprintf("resnapshot:%d", gap.Timestamp), gap); err != nil {
+				if err := store.SaveState(ctx, tx, e.Account, "reconciliation", "resnapshot", gap); err != nil {
 					return err
 				}
 				return store.SaveState(ctx, tx, e.Account, "realtime", "resnapshot", gap)
@@ -220,6 +227,9 @@ func (e *Engine) Follow(ctx context.Context) error {
 		if err := e.Initialize(ctx); err != nil {
 			return err
 		}
+		if err := e.PrepareRealtime(ctx); err != nil {
+			return err
+		}
 		if err := e.DB.SetState(ctx, e.Account, "realtime", "resnapshot", store.State{LastSuccess: time.Now().UnixMilli()}); err != nil {
 			return err
 		}
@@ -234,7 +244,7 @@ func (e *Engine) Follow(ctx context.Context) error {
 func (e *Engine) unparsedBatch(ctx context.Context, b []byte) error {
 	raw, _ := json.Marshal(map[string]string{"unparseable_delta_batch": string(b)})
 	err := e.archiveTransaction(ctx, func(tx *sql.Tx) error {
-		if err := store.Put(ctx, tx, store.Record{Table: "deltas", Account: e.Account, Identity: "unparsed:" + store.Hash(b), Origin: "dgw-unparsed", Raw: raw}); err != nil {
+		if err := store.Put(ctx, tx, store.Record{Table: "deltas", Account: e.Account, Identity: "unparsed:" + store.Hash(b), Origin: "dgw-unparsed", Hash: store.Hash(b), Raw: raw}); err != nil {
 			return err
 		}
 		return store.SaveState(ctx, tx, e.Account, "realtime", "gap", store.State{Error: "unparseable realtime batch; original bytes retained, checkpoint unchanged"})
