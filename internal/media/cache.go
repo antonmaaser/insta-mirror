@@ -95,12 +95,8 @@ func allowed(u *url.URL) bool {
 	}
 	return false
 }
-func attachments(raw json.RawMessage) []attachment {
-	var msg slidetypes.Message
-	if json.Unmarshal(raw, &msg) != nil {
-		return nil
-	}
-	out := []attachment{}
+func DescribeAttachments(msg slidetypes.Message) []store.Attachment {
+	out := []store.Attachment{}
 	add := func(ref string, urls ...string) {
 		nonempty := []string{}
 		for _, u := range urls {
@@ -112,7 +108,7 @@ func attachments(raw json.RawMessage) []attachment {
 			if ref == "" || ref == "attachment_fbid:" {
 				ref = "url_sha256:" + store.Hash([]byte(nonempty[0]))
 			}
-			out = append(out, attachment{ref: ref, urls: nonempty})
+			out = append(out, store.Attachment{Key: ref, URLs: nonempty, Kind: msg.ContentType})
 		}
 	}
 	ordinary := func(items []*slidetypes.Attachment) {
@@ -154,11 +150,12 @@ func attachments(raw json.RawMessage) []attachment {
 			}
 		}
 	case *slidetypes.MessageContentRavenImage, *slidetypes.MessageContentRavenVideo:
-		out = append(out, attachment{ref: "restricted-ephemeral-media", blocked: true})
+		out = append(out, store.Attachment{Key: "restricted-ephemeral-media", Restricted: true, Kind: msg.ContentType})
 	}
 	if !msg.ExpirationTimestampMS.IsZero() || !msg.ViewExpirationTimestampMS.IsZero() {
 		for i := range out {
-			out[i].blocked = true
+			out[i].Restricted = true
+			out[i].URLs = nil
 		}
 	}
 	return out
@@ -182,7 +179,12 @@ func (c *Cache) Sync(ctx context.Context, account string) error {
 			for _, m := range prior {
 				existing[m.Attachment] = m
 			}
-			for _, a := range attachments(r.Raw) {
+			var msg slidetypes.Message
+			if err := json.Unmarshal(r.Raw, &msg); err != nil {
+				return err
+			}
+			for _, desc := range DescribeAttachments(msg) {
+				a := attachment{ref: desc.Key, urls: desc.URLs, blocked: desc.Restricted}
 				m := existing[a.ref]
 				urlBytes, _ := json.Marshal(a.urls)
 				urlHash := store.Hash(urlBytes)

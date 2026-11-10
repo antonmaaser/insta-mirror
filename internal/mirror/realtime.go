@@ -2,8 +2,6 @@ package mirror
 
 import (
 	"context"
-	"database/sql"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,110 +12,81 @@ import (
 	"go.mau.fi/mautrix-meta/pkg/instameow/slidetypes"
 )
 
-func (e *Engine) captureDeltas(ctx context.Context, b []byte) error {
-	var wrappers []struct {
-		Data struct {
-			Deltas []json.RawMessage `json:"slide_delta_processor"`
-		} `json:"data"`
+func (e *Engine) captureDeltas(ctx context.Context, raw []byte) error {
+	var envelopes []json.RawMessage
+	if json.Unmarshal(raw, &envelopes) != nil || envelopes == nil {
+		return e.blockRealtime(ctx, errors.New("malformed realtime batch"))
 	}
-	var rawWrappers []json.RawMessage
-	malformed := json.Unmarshal(b, &wrappers) != nil || json.Unmarshal(b, &rawWrappers) != nil
-	if !malformed {
-		for _, rawWrapper := range rawWrappers {
-			if !object(field(rawWrapper, "data", "slide_delta_processor")) {
-				malformed = true
-				break
-			}
-		}
-		for _, wrapper := range wrappers {
-			for _, raw := range wrapper.Data.Deltas {
-				var obj map[string]json.RawMessage
-				if json.Unmarshal(raw, &obj) != nil || obj == nil {
-					malformed = true
-					break
-				}
-			}
-		}
-	}
-	if malformed {
-		return e.unparsedBatch(ctx, b)
-	}
-	var parseFailure bool
-	err := e.archiveTransaction(ctx, func(tx *sql.Tx) error {
-		now := time.Now().UnixMilli()
-		var latest int64
-		for wi, w := range wrappers {
-			for di, raw := range w.Data.Deltas {
-				identity := store.Identity("deltas", raw)
-				if identity == "" {
-					// Without source sequence, retain each arrival as an observation. The hash
-					// remains deterministic, while the local occurrence prevents false merges.
-					identity = fmt.Sprintf("unsequenced:%s:%d:%d:%d", store.Hash(raw), time.Now().UnixNano(), wi, di)
-					if err := store.SaveState(ctx, tx, e.Account, "realtime", "unsequenced", store.State{Gaps: []string{"events without source sequence cannot be reliably deduplicated"}}); err != nil {
-						return err
-					}
-				}
-				version, err := store.PutSource(ctx, tx, store.Record{Table: "deltas", Account: e.Account, Identity: identity, Origin: "dgw", Raw: raw, Observed: now})
-				if err != nil {
-					return err
-				}
-				var delta slidetypes.Delta
-				decodeErr := json.Unmarshal(raw, &delta)
-				if decodeErr == nil && delta.UQSeqID > latest {
-					latest = delta.UQSeqID
-				}
-				_, unknown := delta.Data.(slidetypes.UnknownEvent)
-				if decodeErr != nil || unknown {
-					label := "unknown delta retained for query-time interpretation"
-					if decodeErr != nil {
-						label = "delta decoding failed; source content retained"
-						parseFailure = true
-					}
-					if err := store.SaveState(ctx, tx, e.Account, "realtime", "interpretation", map[string]any{"error": label, "seq_id": delta.UQSeqID, "source_reference": store.SourceRef(store.Record{Account: e.Account, Table: "deltas", RowID: version})}); err != nil {
-						return err
-					}
-				}
-			}
-		}
-		var conflict store.State
-		if err := store.ReadState(ctx, tx, e.Account, "realtime", "conflict", &conflict); err != nil {
+	err := e.ingestTransaction(ctx, "realtime", func(b *ingestion) error {
+		var state store.State
+		if err := store.ReadState(ctx, b.tx, e.Account, "realtime", "checkpoint", &state); err != nil {
 			return err
 		}
-		if conflict.Error != "" {
-			parseFailure = true
-		}
-		if !parseFailure && latest > 0 {
-			var prior store.State
-			var state string
-			err := tx.QueryRowContext(ctx, `SELECT state FROM sync_state WHERE account_id=? AND scope='realtime' AND scope_id='checkpoint'`, e.Account).Scan(&state)
-			if err != nil && !errors.Is(err, sql.ErrNoRows) {
-				return err
+		start := state.SeqID
+		for _, envelope := range envelopes {
+			var items []json.RawMessage
+			if json.Unmarshal(field(envelope, "data", "slide_delta_processor"), &items) != nil || items == nil {
+				return errors.New("malformed realtime batch")
 			}
-			if state != "" {
-				if err = json.Unmarshal([]byte(state), &prior); err != nil {
-					return err
+			for _, item := range items {
+				var delta slidetypes.Delta
+				if json.Unmarshal(item, &delta) != nil || delta.UQSeqID <= 0 {
+					return errors.New("invalid or unsequenced realtime event")
+				}
+				var obj sourceObject
+				if json.Unmarshal(item, &obj) != nil {
+					return errors.New("invalid realtime event")
+				}
+				digest := store.Hash([]byte(store.JSONValue(obj)))
+				switch {
+				case delta.UQSeqID < state.SeqID:
+					if delta.UQSeqID > start {
+						return errors.New("realtime batch is out of order")
+					}
+					b.decisions = append(b.decisions, store.Decision{Kind: "event", Action: "ignored_stale", Reason: "sequence already passed"})
+				case delta.UQSeqID == state.SeqID:
+					if state.PageHash != "" && state.PageHash != digest {
+						return store.ErrConflict
+					}
+					b.decisions = append(b.decisions, store.Decision{Kind: "event", Action: "unchanged", Reason: "replayed sequence"})
+				default:
+					b.event = state.Revision + 1
+					if err := b.delta(item, delta); err != nil {
+						return err
+					}
+					state.SeqID, state.PageHash, state.Revision = delta.UQSeqID, digest, b.event
 				}
 			}
-			if latest > prior.SeqID {
-				prior.SeqID = latest
-				prior.Timestamp = now
-				prior.LastSuccess = now
-				return store.SaveState(ctx, tx, e.Account, "realtime", "checkpoint", prior)
-			}
 		}
-		return nil
+		if state.SeqID == start {
+			return nil
+		}
+		state.Timestamp = time.Now().UnixMilli()
+		state.LastSuccess = state.Timestamp
+		state.Error = ""
+		return store.SaveState(ctx, b.tx, e.Account, "realtime", "checkpoint", state)
 	})
 	if err != nil {
-		e.fail(err)
-		return err
-	}
-	if parseFailure {
-		err = errors.New("realtime delta decoding failed; checkpoint retained for recovery")
-		e.fail(err)
-		return err
+		return e.blockRealtime(ctx, err)
 	}
 	return nil
 }
+
+func (e *Engine) blockRealtime(ctx context.Context, cause error) error {
+	var state store.State
+	if err := e.DB.State(ctx, e.Account, "realtime", "checkpoint", &state); err != nil {
+		e.fail(err)
+		return err
+	}
+	state.Error = cause.Error()
+	if err := e.DB.SetState(ctx, e.Account, "realtime", "checkpoint", state); err != nil {
+		e.fail(err)
+		return err
+	}
+	e.fail(cause)
+	return cause
+}
+
 func (e *Engine) fail(err error) {
 	if e.Abort != nil {
 		e.Abort(err)
@@ -135,10 +104,10 @@ func (e *Engine) event(ctx context.Context, event slidetypes.ClientEvent) error 
 	var err error
 	switch v := event.(type) {
 	case *slidetypes.Delta:
-		// The raw batch callback has already archived every delta transactionally.
+		// The raw batch callback applies deltas and progress together.
 		return nil
 	case *slidetypes.SeqIDUpdate:
-		// captureDeltas committed the checkpoint with its source records. The
+		// captureDeltas committed the checkpoint with its changes. The
 		// transport notification must not overwrite it or advance it separately.
 		return nil
 	case *slidetypes.ReconnectionStateUpdate:
@@ -241,20 +210,4 @@ func (e *Engine) Follow(ctx context.Context) error {
 		return cause
 	}
 	return ctx.Err()
-}
-
-func (e *Engine) unparsedBatch(ctx context.Context, b []byte) error {
-	raw, _ := json.Marshal(map[string]string{"unparseable_delta_batch_encoding": "base64", "unparseable_delta_batch": base64.StdEncoding.EncodeToString(b)})
-	err := e.archiveTransaction(ctx, func(tx *sql.Tx) error {
-		version, err := store.PutSource(ctx, tx, store.Record{Table: "deltas", Account: e.Account, Identity: fmt.Sprintf("unparsed:%s:%d", store.Hash(b), time.Now().UnixNano()), Origin: "dgw-unparsed", Hash: store.Hash(b), Raw: raw})
-		if err != nil {
-			return err
-		}
-		return store.SaveState(ctx, tx, e.Account, "realtime", "gap", map[string]any{"error": "unparseable realtime batch; original bytes retained, checkpoint unchanged", "source_reference": store.SourceRef(store.Record{Account: e.Account, Table: "deltas", RowID: version})})
-	})
-	if err == nil {
-		err = errors.New("unparseable realtime batch; synchronization stopped with a recoverable gap")
-	}
-	e.fail(err)
-	return err
 }

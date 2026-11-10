@@ -28,6 +28,7 @@ CREATE TABLE messages (
  sent_at INTEGER, body TEXT, kind TEXT, snippet TEXT, attachments TEXT, edits TEXT,
  edited_at INTEGER, expires_at INTEGER, view_expires_at INTEGER, forwarded INTEGER,
  pinned INTEGER, reported INTEGER, ai_generated INTEGER, deleted INTEGER, placeholder INTEGER NOT NULL DEFAULT 1,
+ reactions_known INTEGER, mentions_known INTEGER,
  last_event INTEGER NOT NULL DEFAULT 0, UNIQUE(account_id,id),
  FOREIGN KEY(account_id,thread_id) REFERENCES threads(account_id,id),
  FOREIGN KEY(account_id,sender_id) REFERENCES users(account_id,id),

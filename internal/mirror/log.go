@@ -3,13 +3,14 @@ package mirror
 import (
 	"bufio"
 	"context"
-	"database/sql"
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"time"
+
+	"database/sql"
+	"go.mau.fi/mautrix-meta/internal/store"
 )
 
 const syncLogLimit = 1000
@@ -87,27 +88,20 @@ func (l *syncLog) save() error {
 	return os.Rename(f.Name(), l.path)
 }
 
-type createdItem struct {
-	kind, account string
-	rowID         int64
-}
-
-func (l *syncLog) created(items []createdItem) {
-	if len(items) == 0 {
+func (l *syncLog) decisions(account, acquisition string, items []store.Decision) {
+	if l == nil || len(items) == 0 {
 		return
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	for _, item := range items {
-		line := fmt.Sprintf("%s stored %s version=%d account=%q", time.Now().UTC().Format(time.RFC3339Nano), strings.TrimSuffix(item.kind, "s"), item.rowID, item.account)
+		line := fmt.Sprintf("%s %s %s local_id=%d account=%q context=%q fields=%q reason=%q", time.Now().UTC().Format(time.RFC3339Nano), item.Action, item.Kind, item.ID, account, acquisition, item.Fields, item.Reason)
 		l.append(line)
 		fmt.Fprintln(os.Stderr, line)
 	}
-	// Diagnostics must not turn an already committed source transaction into a
-	// failed ingestion. Keep console logging if the retained file cannot be saved.
 	if err := l.save(); err != nil {
 		if !l.reported {
-			fmt.Fprintf(os.Stderr, "cannot update sync log: %v\n", err)
+			fmt.Fprintln(os.Stderr, "cannot update sync log")
 		}
 		l.reported = true
 	} else {
@@ -115,42 +109,23 @@ func (l *syncLog) created(items []createdItem) {
 	}
 }
 
-// Source transactions report only newly inserted rows, after a successful
-// commit. An upsert that merely refreshes observation time produces no entry.
-func (e *Engine) archiveTransaction(ctx context.Context, fn func(*sql.Tx) error) error {
-	if e.Log == nil {
-		return e.DB.Transaction(ctx, fn)
-	}
-	var items []createdItem
+func (e *Engine) ingestTransaction(ctx context.Context, acquisition string, apply func(*ingestion) error) error {
+	b := &ingestion{ctx: ctx, account: e.Account}
 	err := e.DB.Transaction(ctx, func(tx *sql.Tx) error {
-		var before int64
-		if err := tx.QueryRowContext(ctx, `SELECT coalesce(max(version_id),0) FROM source_versions`).Scan(&before); err != nil {
-			return err
-		}
-		if err := fn(tx); err != nil {
-			return err
-		}
-		rows, err := tx.QueryContext(ctx, `SELECT kind,version_id,account_id FROM source_versions WHERE version_id>? AND kind IN ('threads','messages','users','deltas') ORDER BY version_id`, before)
-		if err != nil {
-			return err
-		}
-		for rows.Next() {
-			var item createdItem
-			if err = rows.Scan(&item.kind, &item.rowID, &item.account); err != nil {
-				rows.Close()
-				return err
-			}
-			items = append(items, item)
-		}
-		err = rows.Err()
-		rows.Close()
-		if err != nil {
-			return err
-		}
-		return nil
+		b.tx = tx
+		return apply(b)
 	})
 	if err == nil {
-		e.Log.created(items)
+		e.Log.decisions(e.Account, acquisition, b.decisions)
+		return nil
 	}
+	var rolledBack []store.Decision
+	for _, d := range b.decisions {
+		if d.Action == "conflict" || d.Action == "deferred" {
+			rolledBack = append(rolledBack, d)
+		}
+	}
+	rolledBack = append(rolledBack, store.Decision{Kind: "acquisition", Action: "rolled_back", Reason: err.Error()})
+	e.Log.decisions(e.Account, acquisition, rolledBack)
 	return err
 }

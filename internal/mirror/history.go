@@ -1,7 +1,6 @@
 package mirror
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -10,7 +9,6 @@ import (
 	"math/rand/v2"
 	"net"
 	"strconv"
-	"strings"
 	"time"
 
 	"go.mau.fi/mautrix-meta/internal/store"
@@ -39,11 +37,12 @@ type Engine struct {
 	SaveConnection func(json.RawMessage) error
 }
 type pageSpec struct {
-	Scope, ID, Path, Previous string
-	Start                     bool
-	Revision                  int64
-	Preserve                  bool
-	Messages                  bool
+	Scope, ID, Path, Previous  string
+	Start                      bool
+	Revision, RealtimeRevision int64
+	Remote                     string
+	Preserve                   bool
+	Messages                   bool
 }
 type rawPage struct {
 	Edges []struct {
@@ -63,244 +62,205 @@ func field(raw json.RawMessage, path ...string) json.RawMessage {
 	return raw
 }
 func object(raw json.RawMessage) bool { return len(raw) > 0 && string(raw) != "null" }
-func (e *Engine) archive(ctx context.Context, raw []byte, spec pageSpec) error {
-	var envelope struct {
-		Errors    json.RawMessage `json:"errors"`
-		ErrorCode int             `json:"error"`
+func (e *Engine) applyPage(ctx context.Context, raw []byte, spec pageSpec) error {
+	envelope, err := decodeObject(raw)
+	if err != nil {
+		return err
 	}
-	if err := json.Unmarshal(raw, &envelope); err != nil {
-		return errors.New("invalid GraphQL JSON")
+	if envelope.id("error") != "" || envelope.id("error_code") != "" || object(envelope["errors"]) && string(envelope["errors"]) != "[]" {
+		return errors.New("partial GraphQL response")
 	}
-	partial := envelope.ErrorCode != 0 || object(envelope.Errors) && string(envelope.Errors) != "[]"
-
 	source := field(raw, "data", spec.Path)
-	if partial && len(source) == 0 {
-		return nil
-	}
-	if !object(source) {
-		if spec.Messages && len(source) > 0 {
-			err := e.retainIncomplete(ctx, spec, source, nil, "thread is inaccessible; existing history retained")
-			if partial && errors.Is(err, errUncoveredSource) {
-				return nil
-			}
-			return err
-		}
-		if partial {
-			return nil
-		}
-		return errors.New("source page unavailable; coverage is incomplete")
-	}
-
 	container := source
-	if spec.Messages {
-		container = field(source, "as_ig_direct_thread")
-	}
-	if !object(container) || spec.Messages && !bytes.HasPrefix(bytes.TrimSpace(container), []byte("{")) {
-		err := e.retainIncomplete(ctx, spec, source, nil, "thread is inaccessible; existing history retained")
-		if partial && errors.Is(err, errUncoveredSource) {
-			return nil
-		}
-		return err
-	}
-
-	if partial {
-		err := e.retainIncomplete(ctx, spec, source, container, "partial GraphQL source retained without pagination coverage")
-		// Let upstream process its GraphQL error/reload path after the safe capture.
-		if errors.Is(err, errUncoveredSource) {
-			return nil
-		}
-		return err
-	}
 	pageField := "threads_by_folder"
 	if spec.Messages {
+		container = field(source, "as_ig_direct_thread")
 		pageField = "slide_messages"
 	}
+	if !object(container) {
+		return errors.New("source unavailable; previous coverage retained")
+	}
+	pagination := field(container, pageField)
 	var page rawPage
-	if err := json.Unmarshal(field(container, pageField), &page); err != nil || page.Info == nil {
-		return e.retainIncomplete(ctx, spec, source, container, "source page retained without pagination coverage")
+	if json.Unmarshal(pagination, &page) != nil || page.Info == nil || !object(field(pagination, "edges")) {
+		return errors.New("source page has no valid pagination coverage")
 	}
-	flag := string(field(container, pageField, "page_info", "has_next_page"))
-	if flag != "true" && flag != "false" {
-		return e.retainIncomplete(ctx, spec, source, container, "source page retained without an explicit pagination boundary")
+	switch string(field(pagination, "page_info", "has_next_page")) {
+	case "true", "false":
+	default:
+		return errors.New("source page has no explicit pagination boundary")
 	}
-	now := time.Now().UnixMilli()
-
-	var stalled, stale bool
-	err := e.archiveTransaction(ctx, func(tx *sql.Tx) error {
-		var prior store.State
+	return e.ingestTransaction(ctx, spec.Scope+":"+spec.ID, func(b *ingestion) error {
+		tx := b.tx
+		var prior, realtime store.State
 		if err := store.ReadState(ctx, tx, e.Account, spec.Scope, spec.ID, &prior); err != nil {
 			return err
 		}
-		stale = prior.Revision != spec.Revision
-		state := store.State{Cursor: page.Info.EndCursor, Complete: !page.Info.HasNextPage, LastSuccess: now, PageHash: "", Revision: prior.Revision + 1, Generation: prior.Generation}
-		for _, gap := range prior.Gaps {
-			if strings.HasPrefix(gap, "source page retained without") || gap == "partial GraphQL source retained without pagination coverage" || gap == "thread is inaccessible; existing history retained" || gap == "pagination cursor did not advance" {
-				continue
+		if prior.Revision != spec.Revision {
+			return errors.New("stale acquisition checkpoint")
+		}
+		if err := store.ReadState(ctx, tx, e.Account, "realtime", "checkpoint", &realtime); err != nil {
+			return err
+		}
+		b.fill = spec.Scope == "thread" || spec.Messages && !spec.Start || realtime.Revision != spec.RealtimeRevision
+		now := time.Now().UnixMilli()
+		state := store.State{Cursor: page.Info.EndCursor, Complete: !page.Info.HasNextPage, LastSuccess: now, Revision: prior.Revision + 1, Generation: prior.Generation}
+		var ids []int64
+		if spec.Messages {
+			local, err := strconv.ParseInt(spec.ID, 10, 64)
+			if err != nil {
+				return err
 			}
-			state.Gaps = append(state.Gaps, gap)
+			thread, err := b.thread(container, local, spec.Remote, spec.Path == "get_slide_thread_nullable")
+			if err != nil {
+				return err
+			}
+			var deleted sql.NullBool
+			if err = tx.QueryRowContext(ctx, "SELECT deleted FROM threads WHERE id=?", thread).Scan(&deleted); err != nil {
+				return err
+			}
+			if deleted.Bool {
+				return nil
+			}
+			for _, edge := range page.Edges {
+				id, err := b.message(edge.Node, thread, false)
+				if err != nil {
+					return err
+				}
+				ids = append(ids, id)
+			}
+		} else {
+			for _, edge := range page.Edges {
+				id, err := b.inboxThread(edge.Node, false)
+				if err != nil {
+					return err
+				}
+				ids = append(ids, id)
+			}
+			if rawPinned := field(source, "pinned_threads_v2"); object(rawPinned) {
+				var pinned []json.RawMessage
+				if json.Unmarshal(rawPinned, &pinned) != nil {
+					return errors.New("invalid pinned threads")
+				}
+				for _, item := range pinned {
+					if _, err := b.inboxThread(item, true); err != nil {
+						return err
+					}
+				}
+			}
 		}
 		if spec.Scope == "head" {
 			state.Anchor, state.Target, state.Candidate = prior.Anchor, prior.Target, prior.Candidate
 			if spec.Start {
-				state.Target = prior.Anchor
-				state.Candidate = ""
+				state.Target, state.Candidate = prior.Anchor, ""
 			}
-			if state.Candidate == "" && len(page.Edges) > 0 {
-				state.Candidate = store.String(page.Edges[0].Node, "id")
+			if state.Candidate == "" && len(ids) > 0 {
+				state.Candidate = strconv.FormatInt(ids[0], 10)
 			}
-			// Only the prior completed full-message head is an overlap boundary.
-			// An initial head seeds backfill and need not duplicate that entire walk.
 			if state.Target == "" {
 				state.Complete = true
 			}
-			for _, edge := range page.Edges {
-				if state.Target != "" && store.String(edge.Node, "id") == state.Target {
+			for _, id := range ids {
+				if strconv.FormatInt(id, 10) == state.Target {
 					state.Complete = true
 				}
 			}
 			if state.Complete {
-				state.Anchor = state.Candidate
-				state.Target = ""
-				state.Candidate = ""
-			}
-		}
-
-		if spec.Messages {
-			if err := store.Put(ctx, tx, store.Record{Table: "threads", Account: e.Account, Raw: container, Thread: spec.ID, Origin: spec.Path, Context: spec.Scope + ":" + spec.ID + ":" + spec.Previous, Observed: now}); err != nil {
-				return err
-			}
-		} else {
-			if err := store.Put(ctx, tx, store.Record{Table: "mailbox_pages", Account: e.Account, Raw: source, Origin: spec.Path, Context: spec.Scope + ":" + spec.ID + ":" + spec.Previous, Observed: now}); err != nil {
-				return err
-			}
-			for _, edge := range page.Edges {
-				if !object(field(edge.Node, "as_ig_direct_thread")) && len(state.Gaps) == 0 {
-					state.Gaps = []string{"inaccessible thread source retained; conversation content coverage is unknown"}
+				if state.Candidate != "" {
+					state.Anchor = state.Candidate
 				}
+				state.Target, state.Candidate = "", ""
 			}
 		}
-
-		// Resolve page members after normalization has established their aliases.
-		// Different source ID fields and rotating URLs cannot hide a repeated page.
-		pageKeys := []byte{}
-		for _, edge := range page.Edges {
-			node, kind := edge.Node, "messages"
-			if !spec.Messages {
-				node = field(edge.Node, "as_ig_direct_thread")
-				kind = "threads"
-			}
-			key := "unresolved:" + store.Hash(edge.Node)
-			ref := store.Identity(kind, node)
-			if ref != "" {
-				entity, err := store.ResolveEntityTx(ctx, tx, e.Account, kind, ref)
-				if err == nil {
-					key = fmt.Sprintf("%s:%d", kind, entity)
-				} else if !errors.Is(err, sql.ErrNoRows) {
-					return err
-				}
-			}
-			pageKeys = append(pageKeys, key...)
-			pageKeys = append(pageKeys, 0)
-		}
-		state.PageHash = store.Hash(pageKeys)
-		stalled = !state.Complete && (state.Cursor == "" || state.Cursor == spec.Previous || prior.PageHash == state.PageHash && prior.Cursor != state.Cursor)
-		if stalled {
-			state.Cursor = prior.Cursor
-			state.Error = "pagination cursor did not advance"
-			state.Gaps = []string{state.Error}
+		state.PageHash = store.Hash([]byte(store.JSONValue(ids)))
+		if !spec.Preserve && !state.Complete && (state.Cursor == "" || state.Cursor == spec.Previous || prior.PageHash == state.PageHash) {
+			return errors.New("pagination did not advance")
 		}
 		if spec.Path == "get_slide_mailbox_for_iris_subscription" {
-			var checkpoint, resnapshot store.State
-			if err := store.ReadState(ctx, tx, e.Account, "realtime", "checkpoint", &checkpoint); err != nil {
-				return err
-			}
+			var resnapshot store.State
 			if err := store.ReadState(ctx, tx, e.Account, "realtime", "resnapshot", &resnapshot); err != nil {
 				return err
 			}
-			if checkpoint.SeqID == 0 || len(resnapshot.Gaps) > 0 {
-				seq, err := strconv.ParseInt(store.String(source, "iris_inactive_subscription_uq_seq_id"), 10, 64)
+			if realtime.SeqID == 0 || len(resnapshot.Gaps) > 0 {
+				o, err := decodeObject(source)
+				if err != nil {
+					return err
+				}
+				seq, err := strconv.ParseInt(o.id("iris_inactive_subscription_uq_seq_id"), 10, 64)
 				if err != nil || seq <= 0 {
 					return errors.New("mailbox has no valid subscription sequence")
 				}
-				gaps := []string{"initial snapshot baseline; older realtime events were not acquired"}
-				if len(resnapshot.Gaps) > 0 {
-					gaps = resnapshot.Gaps
+				realtime.SeqID, realtime.Timestamp, realtime.LastSuccess = seq, now, now
+				realtime.Revision++
+				realtime.PageHash, realtime.Error = "", ""
+				realtime.Gaps = resnapshot.Gaps
+				if len(realtime.Gaps) == 0 {
+					realtime.Gaps = []string{"initial mailbox baseline; earlier realtime changes were not acquired"}
 				}
-				if err = store.SaveState(ctx, tx, e.Account, "realtime", "checkpoint", store.State{SeqID: seq, Timestamp: now, LastSuccess: now, Gaps: gaps}); err != nil {
+				if err = store.SaveState(ctx, tx, e.Account, "realtime", "checkpoint", realtime); err != nil {
 					return err
 				}
 			}
 		}
-		if spec.Scope == "head" && !stale {
+		if spec.Scope == "head" && spec.Start {
 			var tail store.State
 			if err := store.ReadState(ctx, tx, e.Account, "thread", spec.ID, &tail); err != nil {
 				return err
 			}
 			if tail.LastSuccess == 0 {
-				tail.Cursor = page.Info.EndCursor
-				tail.Complete = !page.Info.HasNextPage
-				tail.LastSuccess = now
-				tail.PageHash = state.PageHash
+				tail.Cursor, tail.Complete, tail.LastSuccess, tail.PageHash = page.Info.EndCursor, !page.Info.HasNextPage, now, state.PageHash
 				tail.Revision++
+				if !tail.Complete && tail.Cursor == "" {
+					return errors.New("initial thread page has no continuation cursor")
+				}
 				if err := store.SaveState(ctx, tx, e.Account, "thread", spec.ID, tail); err != nil {
 					return err
 				}
 			}
 		}
-
-		if spec.Preserve || stale {
+		if spec.Preserve {
 			return nil
 		}
 		return store.SaveState(ctx, tx, e.Account, spec.Scope, spec.ID, state)
 	})
-	if err != nil {
-		return err
-	}
-	if stale && !spec.Preserve {
-		return errors.New("stale page retained without changing its checkpoint")
-	}
-	if stalled && !spec.Preserve {
-		return errors.New("pagination cursor did not advance")
-	}
-	return nil
 }
 
-var errUncoveredSource = errors.New("source response retained without advancing its checkpoint")
-
-// Coverage decoding must not discard already acquired source content. Nullable
-// thread responses are evidence of a boundary, not empty conversation snapshots.
-func (e *Engine) retainIncomplete(ctx context.Context, spec pageSpec, source, container json.RawMessage, label string) error {
-	err := e.archiveTransaction(ctx, func(tx *sql.Tx) error {
-		r := store.Record{Account: e.Account, Origin: spec.Path + ":partial", Context: spec.Scope + ":" + spec.ID + ":" + spec.Previous, Observed: time.Now().UnixMilli()}
-		if spec.Messages {
-			r.Thread = spec.ID
-			if len(container) > 0 {
-				r.Table = "threads"
-				r.Raw = container
-			} else {
-				r.Table = "thread_boundaries"
-				r.Raw = source
+func (b *ingestion) inboxThread(raw json.RawMessage, pinned bool) (int64, error) {
+	wrapper, err := decodeObject(raw)
+	if err != nil {
+		return 0, err
+	}
+	thread, err := b.thread(wrapper["as_ig_direct_thread"], 0, wrapper.id("id"), false)
+	if err != nil {
+		return 0, err
+	}
+	if pinned {
+		fields, err := b.patch("threads", thread, map[string]any{"pinned": int64(1)}, b.fill)
+		if err != nil {
+			return 0, err
+		}
+		b.decision("threads", thread, false, false, b.fill, fields)
+	}
+	prior := b.fill
+	b.fill = true
+	defer func() { b.fill = prior }()
+	if rawMessages := field(raw, "as_ig_direct_thread", "slide_messages", "edges"); object(rawMessages) {
+		var edges []struct {
+			Node json.RawMessage `json:"node"`
+		}
+		if json.Unmarshal(rawMessages, &edges) != nil {
+			return 0, errors.New("invalid inbox messages")
+		}
+		for _, edge := range edges {
+			if _, err = b.message(edge.Node, thread, false); err != nil {
+				return 0, err
 			}
-		} else {
-			r.Table = "mailbox_pages"
-			r.Raw = source
 		}
-		if err := store.Put(ctx, tx, r); err != nil {
-			return err
-		}
-		var state store.State
-		if err := store.ReadState(ctx, tx, e.Account, spec.Scope, spec.ID, &state); err != nil {
-			return err
-		}
-		state.Error = label
-		state.Gaps = []string{label}
-		return store.SaveState(ctx, tx, e.Account, spec.Scope, spec.ID, state)
-	})
-	if err != nil {
-		return err
 	}
-	return errUncoveredSource
+	return thread, nil
 }
+
+type acquisitionError struct{ error }
 
 func pause(ctx context.Context, d time.Duration) error {
 	t := time.NewTimer(d)
@@ -318,6 +278,11 @@ func (e *Engine) fetch(ctx context.Context, spec pageSpec, fn func(context.Conte
 		return err
 	}
 	spec.Revision = expected.Revision
+	var realtime store.State
+	if err := e.DB.State(ctx, e.Account, "realtime", "checkpoint", &realtime); err != nil {
+		return err
+	}
+	spec.RealtimeRevision = realtime.Revision
 	var err error
 	for attempt := 0; attempt < 4; attempt++ {
 		if err = pause(ctx, 800*time.Millisecond+time.Duration(rand.IntN(400))*time.Millisecond); err != nil {
@@ -330,7 +295,10 @@ func (e *Engine) fetch(ctx context.Context, spec pageSpec, fn func(context.Conte
 				return nil
 			}
 			captured = true
-			return e.archive(ctx, b, spec)
+			if err := e.applyPage(ctx, b, spec); err != nil {
+				return acquisitionError{err}
+			}
+			return nil
 		}))
 		err = fn(callCtx)
 		if err == nil && !captured {
@@ -351,9 +319,10 @@ func (e *Engine) fetch(ctx context.Context, spec pageSpec, fn func(context.Conte
 	if stateErr := e.DB.State(ctx, e.Account, spec.Scope, spec.ID, &state); stateErr != nil {
 		return stateErr
 	}
-	state.Error = "source retrieval or archival failed; retry synchronization"
-	if errors.Is(err, errUncoveredSource) {
-		state.Error = errUncoveredSource.Error()
+	state.Error = "source retrieval failed; retry synchronization"
+	var blocked acquisitionError
+	if errors.As(err, &blocked) {
+		state.Error = blocked.Error()
 	}
 	if errors.Is(err, httpclient.ErrChallengeRequired) || errors.Is(err, httpclient.ErrCheckpointRequired) || errors.Is(err, httpclient.ErrTokenInvalidated) {
 		state.Error = "authentication requires attention; run login"
@@ -416,18 +385,22 @@ func (e *Engine) History(ctx context.Context) error {
 			folderErrors = append(folderErrors, folder+": source availability boundaries retained; see folder state")
 		}
 	}
-	rows, err := e.DB.DB.QueryContext(ctx, `SELECT DISTINCT value FROM source_ids WHERE account_id=? AND namespace='thread.fbid'`, e.Account)
+	rows, err := e.DB.DB.QueryContext(ctx, `SELECT t.id, i.remote_id FROM threads t JOIN source_ids i ON i.account_id=t.account_id AND i.thread_id=t.id AND i.namespace='thread.fbid' WHERE t.account_id=? AND coalesce(t.deleted,0)=0 ORDER BY t.id`, e.Account)
 	if err != nil {
 		return err
 	}
-	var threads []string
+	type target struct {
+		local  int64
+		remote string
+	}
+	var threads []target
 	for rows.Next() {
-		var id string
-		if err = rows.Scan(&id); err != nil {
+		var t target
+		if err = rows.Scan(&t.local, &t.remote); err != nil {
 			rows.Close()
 			return err
 		}
-		threads = append(threads, id)
+		threads = append(threads, t)
 	}
 	err = rows.Err()
 	rows.Close()
@@ -435,8 +408,8 @@ func (e *Engine) History(ctx context.Context) error {
 		return err
 	}
 	var failures int
-	for _, id := range threads {
-		if err = e.historyThread(ctx, id); err != nil {
+	for _, target := range threads {
+		if err = e.historyThread(ctx, strconv.FormatInt(target.local, 10), target.remote); err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
@@ -449,7 +422,7 @@ func (e *Engine) History(ctx context.Context) error {
 	}
 	state := store.State{Complete: failures == 0 && len(folderErrors) == 0, LastSuccess: previous.LastSuccess, Gaps: folderErrors}
 	var unresolved int
-	if err = e.DB.DB.QueryRowContext(ctx, `SELECT count(*) FROM threads t WHERE t.account_id=? AND t.merged_into IS NULL AND NOT EXISTS(SELECT 1 FROM source_ids i WHERE i.account_id=t.account_id AND i.thread_entity_id=t.entity_id AND i.namespace='thread.fbid')`, e.Account).Scan(&unresolved); err != nil {
+	if err = e.DB.DB.QueryRowContext(ctx, `SELECT count(*) FROM threads t WHERE t.account_id=? AND coalesce(t.deleted,0)=0 AND NOT EXISTS(SELECT 1 FROM source_ids i WHERE i.account_id=t.account_id AND i.thread_id=t.id AND i.namespace='thread.fbid')`, e.Account).Scan(&unresolved); err != nil {
 		return err
 	}
 	if unresolved > 0 {
@@ -470,7 +443,7 @@ func (e *Engine) History(ctx context.Context) error {
 	}
 	return nil
 }
-func (e *Engine) historyThread(ctx context.Context, id string) error {
+func (e *Engine) historyThread(ctx context.Context, id, remote string) error {
 	var gap store.State
 	if err := e.DB.State(ctx, e.Account, "reconciliation", "resnapshot", &gap); err != nil {
 		return err
@@ -492,21 +465,12 @@ func (e *Engine) historyThread(ctx context.Context, id string) error {
 		return err
 	}
 	if head.Complete || head.LastSuccess == 0 {
-		if err := e.fetch(ctx, pageSpec{Scope: "head", ID: id, Path: "get_slide_thread_nullable", Messages: true, Start: true}, func(ctx context.Context) error {
-			_, err := e.Client.GetThread(ctx, slidetypes.MakeGetThreadInfoRequest(id))
+		if err := e.fetch(ctx, pageSpec{Scope: "head", ID: id, Remote: remote, Path: "get_slide_thread_nullable", Messages: true, Start: true}, func(ctx context.Context) error {
+			_, err := e.Client.GetThread(ctx, slidetypes.MakeGetThreadInfoRequest(remote))
 			return err
 		}); err != nil {
 			return err
 		}
-	}
-	// Upstream GetThread uses the short FBID; pagination uses the returned id.
-	entity, err := e.DB.ResolveEntity(ctx, e.Account, "threads", "thread_fbid:"+id)
-	if err != nil {
-		return err
-	}
-	var paginationID string
-	if err = e.DB.DB.QueryRowContext(ctx, `SELECT value FROM source_ids WHERE account_id=? AND thread_entity_id=? AND namespace='thread.fbid' ORDER BY source_id LIMIT 1`, e.Account, entity).Scan(&paginationID); err != nil {
-		return err
 	}
 	for _, scope := range []string{"head", "thread"} {
 		seen := map[string]bool{}
@@ -527,9 +491,9 @@ func (e *Engine) historyThread(ctx context.Context, id string) error {
 				return errors.New(state.Error)
 			}
 			seen[cursor] = true
-			spec := pageSpec{Scope: scope, ID: id, Path: "fetch__SlideThread", Messages: true, Previous: cursor}
+			spec := pageSpec{Scope: scope, ID: id, Remote: remote, Path: "fetch__SlideThread", Messages: true, Previous: cursor}
 			if err = e.fetch(ctx, spec, func(ctx context.Context) error {
-				_, err := e.Client.PaginateMessages(ctx, &slidetypes.PaginateMessagesRequest{AfterCursor: &cursor, ThreadID: paginationID, FirstN: 20, InitialMessagePageCount: 20})
+				_, err := e.Client.PaginateMessages(ctx, &slidetypes.PaginateMessagesRequest{AfterCursor: &cursor, ThreadID: remote, FirstN: 20, InitialMessagePageCount: 20})
 				return err
 			}); err != nil {
 				return err
