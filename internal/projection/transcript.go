@@ -52,9 +52,12 @@ func WriteTranscript(ctx context.Context, db *store.Store, chat store.Record, w 
 			names[strconv.FormatInt(user.InteropMessagingUserFBID, 10)] = name
 		}
 	}
-	var coverage store.State
+	var coverage, head store.State
 	if thread.ThreadFBID != "" {
 		if err := db.State(ctx, chat.Account, "thread", thread.ThreadFBID, &coverage); err != nil {
+			return err
+		}
+		if err := db.State(ctx, chat.Account, "head", thread.ThreadFBID, &head); err != nil {
 			return err
 		}
 	}
@@ -63,6 +66,17 @@ func WriteTranscript(ctx context.Context, db *store.Store, chat store.Record, w 
 	fmt.Fprintf(&header, "History exhausted at source: %t\n", coverage.Complete)
 	if coverage.LastSuccess != 0 {
 		fmt.Fprintf(&header, "Last acquired history page (UTC): %s\n", time.UnixMilli(coverage.LastSuccess).UTC().Format(time.RFC3339Nano))
+	}
+	if head.LastSuccess != 0 {
+		fmt.Fprintf(&header, "Last acquired head page (UTC): %s\n", time.UnixMilli(head.LastSuccess).UTC().Format(time.RFC3339Nano))
+	}
+	if head.Error != "" {
+		fmt.Fprintf(&header, "Head acquisition error: %q\n", head.Error)
+	}
+	for _, gap := range head.Gaps {
+		if gap != head.Error {
+			fmt.Fprintf(&header, "Head coverage gap: %q\n", gap)
+		}
 	}
 	if coverage.Error != "" {
 		fmt.Fprintf(&header, "History error: %q\n", coverage.Error)

@@ -21,6 +21,7 @@ type Result struct {
 	Updates        []store.Record      `json:"updates,omitempty"`
 	Completeness   string              `json:"completeness"`
 	Uncertainty    []string            `json:"uncertainty,omitempty"`
+	PartialSources []string            `json:"partial_source_references,omitempty"`
 	FieldSources   map[string][]string `json:"field_sources,omitempty"`
 	Interpretation string              `json:"interpretation,omitempty"`
 	Deleted        bool                `json:"deleted,omitempty"`
@@ -33,6 +34,15 @@ func Build(ctx context.Context, db *store.Store, r store.Record, includeRaw bool
 		return out, err
 	}
 	out.Snapshot = snapshot
+	if r.PartialMessage {
+		out.Uncertainty = append(out.Uncertainty, "only a partial or quoted message observation is available")
+	}
+	if r.Conflict {
+		out.Uncertainty = append(out.Uncertainty, "snapshot sequence is conflicted; source ordering is unresolved")
+	}
+	if strings.HasSuffix(r.Origin, ":partial") {
+		out.Uncertainty = append(out.Uncertainty, "source response was retained without confirmed pagination coverage")
+	}
 	if r.Entity != 0 {
 		out.Resource = store.EntityRef(r)
 	}
@@ -53,6 +63,18 @@ func Build(ctx context.Context, db *store.Store, r store.Record, includeRaw bool
 	}
 	threadRefs := []string{}
 	if r.Table == "messages" {
+		partial, more, err := db.PartialReferences(ctx, r)
+		if err != nil {
+			return out, err
+		}
+		out.PartialSources = partial
+		if len(partial) > 0 {
+			out.Uncertainty = append(out.Uncertainty, "newer partial source responses are retained separately from the selected snapshot")
+		}
+		if more {
+			out.Uncertainty = append(out.Uncertainty, "partial-source reference window exceeds 10 observations")
+		}
+
 		media, err := db.Media(ctx, r.Account, r.RowID)
 		if err != nil {
 			return out, err
@@ -90,6 +112,10 @@ func Build(ctx context.Context, db *store.Store, r store.Record, includeRaw bool
 		var current map[string]any
 		_ = decodeObject(r.Raw, &current)
 		for _, record := range deltas {
+			if record.Conflict {
+				out.Uncertainty = append(out.Uncertainty, "conflicting source event sequence retained without application")
+				continue
+			}
 			var d slidetypes.Delta
 			if err = json.Unmarshal(record.Raw, &d); err != nil {
 				out.Uncertainty = append(out.Uncertainty, "unparseable delta retained")
@@ -135,6 +161,16 @@ func Build(ctx context.Context, db *store.Store, r store.Record, includeRaw bool
 		updates, truncated, err := db.Deltas(ctx, r.Account, threadRefs, nil)
 		if err != nil {
 			return out, err
+		}
+		for _, ref := range threadRefs {
+			var head store.State
+			if err := db.State(ctx, r.Account, "head", ref, &head); err != nil {
+				return out, err
+			}
+			if head.Error != "" {
+				out.Uncertainty = append(out.Uncertainty, "recent thread acquisition failed; retained snapshots do not establish current availability")
+				break
+			}
 		}
 		out.Updates = updates
 		if len(updates) > 0 {

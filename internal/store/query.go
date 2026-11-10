@@ -81,7 +81,22 @@ const evidenceCTE = `WITH RECURSIVE evidence(account_id,version_id,observation_i
  FROM evidence e JOIN source_observations o ON o.observation_id=e.observation_id GROUP BY e.account_id,e.version_id
  )`
 
+// Only direct history-page entries and known message-bearing delta roots are
+// full snapshots. A quoted reply cannot acquire its parent's event sequence.
+func fullMessageWitness(version, observation string) string {
+	return `substr(` + observation + `.origin,-8)!=':partial' AND (
+ EXISTS(SELECT 1 FROM source_versions root WHERE root.version_id=` + observation + `.version_id AND root.kind='messages' AND root.version_id=` + version + `)
+ OR EXISTS(SELECT 1 FROM source_relations direct JOIN source_versions parent ON parent.version_id=direct.parent_id
+ WHERE direct.parent_id=` + observation + `.version_id AND direct.child_id=` + version + ` AND (
+ (parent.kind='threads' AND direct.field='slide_messages.edges.node' AND ` + observation + `.origin IN ('get_slide_thread_nullable','fetch__SlideThread')) OR
+ (parent.kind='deltas' AND direct.field='message' AND json_extract(parent.residual,'$.__typename') IN ('SlideUQPPNewMessage','SlideUQPPNewRavenMessage','SlideUQPPNewGenieMessage','SlideUQPPAdminTextMessage','SlideUQPPThreadName','SlideUQPPThreadImage','SlideUQPPParticipantLeftGroupThread','SlideUQPPParticipantsAddedToGroupThread')))))`
+}
 func sourceSelection(kind string) string {
+	if kind == "messages" {
+		return `SELECT v.*,p.origin,p.acquired_thread_id,p.source_hash,coalesce(f.observation_id,e.observation_id) AS observation_id,e.observed_at_ms,e.last_observed_at_ms,(f.observation_id IS NOT NULL) AS full_snapshot FROM messages_versions v JOIN visible e ON e.account_id=v.account_id AND e.version_id=v.version_id
+ LEFT JOIN (SELECT ev.version_id,max(o.observation_id) AS observation_id FROM evidence ev JOIN source_observations o ON o.observation_id=ev.observation_id JOIN source_versions mv ON mv.version_id=ev.version_id AND mv.kind='messages' WHERE ` + fullMessageWitness("ev.version_id", "o") + ` GROUP BY ev.version_id) f ON f.version_id=v.version_id
+ JOIN source_observations p ON p.observation_id=coalesce(f.observation_id,e.observation_id) WHERE v.entity_id>0`
+	}
 	return `SELECT v.*,p.origin,p.acquired_thread_id,p.source_hash,e.observation_id,e.observed_at_ms,e.last_observed_at_ms FROM ` + kind + `_versions v JOIN visible e ON e.account_id=v.account_id AND e.version_id=v.version_id JOIN source_observations p ON p.observation_id=e.observation_id WHERE v.entity_id>0`
 }
 func sourceCTE(kind string) string {
@@ -90,7 +105,7 @@ func sourceCTE(kind string) string {
 func rankOrder(kind string) string {
 	switch kind {
 	case "messages":
-		return `(json_type(residual,'$.message_id') IS NOT NULL OR origin IN ('get_slide_thread_nullable','fetch__SlideThread','dgw')) DESC,observation_id DESC,version_id DESC`
+		return `full_snapshot DESC,observation_id DESC,version_id DESC`
 	case "threads":
 		return `(json_type(residual,'$.thread_subtype') IS NOT NULL) DESC,observation_id DESC,version_id DESC`
 	default:
@@ -428,4 +443,37 @@ func (s *Store) MessageThreadReferences(ctx context.Context, account string, ver
 		out = append(out, value)
 	}
 	return out, rows.Err()
+}
+
+// PartialReferences exposes newer captured evidence without presenting an
+// incomplete response as a replacement for a fuller message snapshot.
+func (s *Store) PartialReferences(ctx context.Context, r Record) ([]string, bool, error) {
+	top := r.watermark
+	if top == 0 {
+		if err := s.queryRowContext(ctx, `SELECT coalesce(max(observation_id),0) FROM source_observations WHERE account_id=?`, r.Account).Scan(&top); err != nil {
+			return nil, false, err
+		}
+	}
+	rows, err := s.queryContext(ctx, `WITH RECURSIVE ancestors(target,id) AS (
+ SELECT version_id,version_id FROM source_versions WHERE account_id=? AND kind='messages' AND message_entity_id IN (SELECT entity_id FROM messages WHERE account_id=? AND (entity_id=? OR merged_into=?)) AND version_id!=?
+ UNION SELECT a.target,rel.parent_id FROM ancestors a JOIN source_relations rel ON rel.child_id=a.id
+ ) SELECT a.target,max(o.observation_id) FROM ancestors a JOIN source_observations o ON o.version_id=a.id WHERE o.account_id=? AND o.observation_id>? AND o.observation_id<=? AND NOT (`+fullMessageWitness("a.target", "o")+`) GROUP BY a.target ORDER BY max(o.observation_id) DESC LIMIT 11`, r.Account, r.Account, r.Entity, r.Entity, r.Version, r.Account, r.Observation, top)
+	if err != nil {
+		return nil, false, err
+	}
+	defer rows.Close()
+	out := []string{}
+	more := false
+	for rows.Next() {
+		var version, observation int64
+		if err = rows.Scan(&version, &observation); err != nil {
+			return nil, false, err
+		}
+		if len(out) == 10 {
+			more = true
+			break
+		}
+		out = append(out, SourceRef(Record{Account: r.Account, Table: "messages", RowID: version}))
+	}
+	return out, more, rows.Err()
 }

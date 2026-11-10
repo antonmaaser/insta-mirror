@@ -379,6 +379,9 @@ func putVersion(ctx context.Context, tx *sql.Tx, account, kind string, n *source
 	var owner int64
 	var ownIDs []int64
 	identityError := ""
+	if kind == "thread_boundaries" {
+		identityError = "thread response unavailable; retained as an acquisition boundary, not an empty conversation"
+	}
 
 	if ownerColumn(kind) != "" {
 		if duplicateIdentity(kind, n) {
@@ -654,7 +657,7 @@ func (s *Store) hydrate(ctx context.Context, r *Record) error {
 		return err
 	}
 	r.Representation = "reconstructed_source"
-	r.HashScope = "acquisition_root"
+	r.HashScope = "representative_acquisition_root"
 	if ownerColumn(r.Table) != "" {
 		if err = s.queryRowContext(ctx, `SELECT entity_id FROM `+r.Table+`_versions WHERE account_id=? AND version_id=?`, r.Account, r.Version).Scan(&r.Entity); err != nil {
 			return err
@@ -675,17 +678,54 @@ func (s *Store) hydrate(ctx context.Context, r *Record) error {
 			r.AcquisitionsTruncated = true
 			break
 		}
-		if a.ID == r.Observation {
-			if seq, ok := strings.CutPrefix(a.Event, "uq_seq_id:"); ok {
-				r.Sequence, _ = strconv.ParseInt(seq, 10, 64)
-			}
-		}
-		if a.RootKind == "mailbox_pages" {
+
+		if a.RootKind == "mailbox_pages" || a.RootKind == "thread_boundaries" {
 			a.ExcludedFields = []string{"__token"}
 		}
 		r.Acquisitions = append(r.Acquisitions, a)
 	}
-	return rows.Err()
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return err
+	}
+	basisEvent := ""
+	var rootID int64
+	var rootKind string
+	if r.Observation != 0 {
+		full := true
+		if r.Table == "messages" {
+			err = s.queryRowContext(ctx, `SELECT o.event_identity,o.version_id,root.kind,`+fullMessageWitness("v.version_id", "o")+` FROM source_observations o JOIN source_versions root ON root.version_id=o.version_id JOIN source_versions v ON v.version_id=? WHERE o.account_id=? AND o.observation_id=?`, r.Version, r.Account, r.Observation).Scan(&basisEvent, &rootID, &rootKind, &full)
+			r.PartialMessage = !full
+		} else {
+			err = s.queryRowContext(ctx, `SELECT o.event_identity,o.version_id,root.kind FROM source_observations o JOIN source_versions root ON root.version_id=o.version_id WHERE o.account_id=? AND o.observation_id=?`, r.Account, r.Observation).Scan(&basisEvent, &rootID, &rootKind)
+		}
+		if err != nil {
+			return err
+		}
+		r.RootReference = SourceRef(Record{Account: r.Account, Table: rootKind, RowID: rootID})
+		if r.Table == "deltas" || r.Table == "messages" && full {
+			if seq, ok := strings.CutPrefix(basisEvent, "uq_seq_id:"); ok {
+				r.Sequence, _ = strconv.ParseInt(seq, 10, 64)
+			}
+		}
+	}
+	event := basisEvent
+	if event == "" && r.Table == "deltas" {
+		event = Identity("deltas", r.Raw)
+	}
+	event, _, _ = strings.Cut(event, ":conflict:")
+	if strings.HasPrefix(event, "uq_seq_id:") {
+		if _, parseErr := strconv.ParseInt(strings.TrimPrefix(event, "uq_seq_id:"), 10, 64); parseErr == nil {
+			if err = s.queryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM source_observations WHERE account_id=? AND event_identity GLOB ?)`, r.Account, event+":conflict:*").Scan(&r.Conflict); err != nil {
+				return err
+			}
+		}
+	}
+	if r.Table == "messages" && r.Conflict {
+		r.Sequence = 0
+	}
+	return nil
 }
 
 // Subscription tokens are acquisition credentials, not archive content. Keep

@@ -1,6 +1,7 @@
 package mirror
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -9,6 +10,7 @@ import (
 	"math/rand/v2"
 	"net"
 	"strconv"
+	"strings"
 	"time"
 
 	"go.mau.fi/mautrix-meta/internal/store"
@@ -69,19 +71,45 @@ func (e *Engine) archive(ctx context.Context, raw []byte, spec pageSpec) error {
 	if err := json.Unmarshal(raw, &envelope); err != nil {
 		return errors.New("invalid GraphQL JSON")
 	}
-	if envelope.ErrorCode != 0 || (object(envelope.Errors) && string(envelope.Errors) != "[]") {
+	partial := envelope.ErrorCode != 0 || object(envelope.Errors) && string(envelope.Errors) != "[]"
+
+	source := field(raw, "data", spec.Path)
+	if partial && len(source) == 0 {
 		return nil
 	}
-	source := field(raw, "data", spec.Path)
 	if !object(source) {
+		if spec.Messages && len(source) > 0 {
+			err := e.retainIncomplete(ctx, spec, source, nil, "thread is inaccessible; existing history retained")
+			if partial && errors.Is(err, errUncoveredSource) {
+				return nil
+			}
+			return err
+		}
+		if partial {
+			return nil
+		}
 		return errors.New("source page unavailable; coverage is incomplete")
 	}
+
 	container := source
 	if spec.Messages {
 		container = field(source, "as_ig_direct_thread")
 	}
-	if !object(container) {
-		return errors.New("thread is inaccessible; existing history retained")
+	if !object(container) || spec.Messages && !bytes.HasPrefix(bytes.TrimSpace(container), []byte("{")) {
+		err := e.retainIncomplete(ctx, spec, source, nil, "thread is inaccessible; existing history retained")
+		if partial && errors.Is(err, errUncoveredSource) {
+			return nil
+		}
+		return err
+	}
+
+	if partial {
+		err := e.retainIncomplete(ctx, spec, source, container, "partial GraphQL source retained without pagination coverage")
+		// Let upstream process its GraphQL error/reload path after the safe capture.
+		if errors.Is(err, errUncoveredSource) {
+			return nil
+		}
+		return err
 	}
 	pageField := "threads_by_folder"
 	if spec.Messages {
@@ -89,11 +117,11 @@ func (e *Engine) archive(ctx context.Context, raw []byte, spec pageSpec) error {
 	}
 	var page rawPage
 	if err := json.Unmarshal(field(container, pageField), &page); err != nil || page.Info == nil {
-		return errors.New("source did not provide pagination coverage")
+		return e.retainIncomplete(ctx, spec, source, container, "source page retained without pagination coverage")
 	}
 	flag := string(field(container, pageField, "page_info", "has_next_page"))
 	if flag != "true" && flag != "false" {
-		return errors.New("source did not provide an explicit pagination boundary")
+		return e.retainIncomplete(ctx, spec, source, container, "source page retained without an explicit pagination boundary")
 	}
 	now := time.Now().UnixMilli()
 
@@ -105,7 +133,12 @@ func (e *Engine) archive(ctx context.Context, raw []byte, spec pageSpec) error {
 		}
 		stale = prior.Revision != spec.Revision
 		state := store.State{Cursor: page.Info.EndCursor, Complete: !page.Info.HasNextPage, LastSuccess: now, PageHash: "", Revision: prior.Revision + 1, Generation: prior.Generation}
-		state.Gaps = prior.Gaps
+		for _, gap := range prior.Gaps {
+			if strings.HasPrefix(gap, "source page retained without") || gap == "partial GraphQL source retained without pagination coverage" || gap == "thread is inaccessible; existing history retained" || gap == "pagination cursor did not advance" {
+				continue
+			}
+			state.Gaps = append(state.Gaps, gap)
+		}
 		if spec.Scope == "head" {
 			state.Anchor, state.Target, state.Candidate = prior.Anchor, prior.Target, prior.Candidate
 			if spec.Start {
@@ -231,6 +264,44 @@ func (e *Engine) archive(ctx context.Context, raw []byte, spec pageSpec) error {
 	}
 	return nil
 }
+
+var errUncoveredSource = errors.New("source response retained without advancing its checkpoint")
+
+// Coverage decoding must not discard already acquired source content. Nullable
+// thread responses are evidence of a boundary, not empty conversation snapshots.
+func (e *Engine) retainIncomplete(ctx context.Context, spec pageSpec, source, container json.RawMessage, label string) error {
+	err := e.archiveTransaction(ctx, func(tx *sql.Tx) error {
+		r := store.Record{Account: e.Account, Origin: spec.Path + ":partial", Context: spec.Scope + ":" + spec.ID + ":" + spec.Previous, Observed: time.Now().UnixMilli()}
+		if spec.Messages {
+			r.Thread = spec.ID
+			if len(container) > 0 {
+				r.Table = "threads"
+				r.Raw = container
+			} else {
+				r.Table = "thread_boundaries"
+				r.Raw = source
+			}
+		} else {
+			r.Table = "mailbox_pages"
+			r.Raw = source
+		}
+		if err := store.Put(ctx, tx, r); err != nil {
+			return err
+		}
+		var state store.State
+		if err := store.ReadState(ctx, tx, e.Account, spec.Scope, spec.ID, &state); err != nil {
+			return err
+		}
+		state.Error = label
+		state.Gaps = []string{label}
+		return store.SaveState(ctx, tx, e.Account, spec.Scope, spec.ID, state)
+	})
+	if err != nil {
+		return err
+	}
+	return errUncoveredSource
+}
+
 func pause(ctx context.Context, d time.Duration) error {
 	t := time.NewTimer(d)
 	defer t.Stop()
@@ -281,6 +352,9 @@ func (e *Engine) fetch(ctx context.Context, spec pageSpec, fn func(context.Conte
 		return stateErr
 	}
 	state.Error = "source retrieval or archival failed; retry synchronization"
+	if errors.Is(err, errUncoveredSource) {
+		state.Error = errUncoveredSource.Error()
+	}
 	if errors.Is(err, httpclient.ErrChallengeRequired) || errors.Is(err, httpclient.ErrCheckpointRequired) || errors.Is(err, httpclient.ErrTokenInvalidated) {
 		state.Error = "authentication requires attention; run login"
 	}

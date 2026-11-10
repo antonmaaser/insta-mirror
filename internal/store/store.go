@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -24,9 +25,12 @@ type Record struct {
 	Table                 string   `json:"kind"`
 	Entity                int64    `json:"entity_id,omitempty"`
 	EntityReference       string   `json:"entity_reference,omitempty"`
+	PartialMessage        bool     `json:"partial_message,omitempty"`
+	Conflict              bool     `json:"sequence_conflict,omitempty"`
 	Sequence              int64    `json:"source_sequence,omitempty"`
 	Matches               []string `json:"matching_source_references,omitempty"`
 	HashScope             string   `json:"source_hash_scope"`
+	RootReference         string   `json:"acquisition_root_reference,omitempty"`
 	Observation           int64    `json:"observation_id,omitempty"`
 	AcquisitionsTruncated bool     `json:"acquisitions_truncated,omitempty"`
 	Context               string   `json:"-"`
@@ -184,14 +188,20 @@ func Hash(raw []byte) string { h := sha256.Sum256(raw); return hex.EncodeToStrin
 // Put archives one acquisition root. Embedded content inherits provenance via
 // source_relations, rather than allocating an observation for every descendant.
 func Put(ctx context.Context, tx *sql.Tx, r Record) error {
-	if r.Table != "threads" && r.Table != "messages" && r.Table != "users" && r.Table != "deltas" && r.Table != "mailbox_pages" {
-		return errors.New("invalid source table")
+	_, err := PutSource(ctx, tx, r)
+	return err
+}
+
+// PutSource also returns the immutable version reference for recovery metadata.
+func PutSource(ctx context.Context, tx *sql.Tx, r Record) (versionID int64, err error) {
+	if r.Table != "threads" && r.Table != "messages" && r.Table != "users" && r.Table != "deltas" && r.Table != "mailbox_pages" && r.Table != "thread_boundaries" {
+		return 0, errors.New("invalid source table")
 	}
 	node, err := parseSource(r.Raw)
-	if err != nil || node.shape != '{' {
-		return errors.New("source must be a JSON object")
+	if err != nil || node.shape != '{' && r.Table != "thread_boundaries" {
+		return 0, errors.New("source must be a JSON object")
 	}
-	if r.Table == "mailbox_pages" {
+	if r.Table == "mailbox_pages" || r.Table == "thread_boundaries" {
 		if r.Hash == "" {
 			r.Hash = Hash(r.Raw)
 		}
@@ -199,25 +209,26 @@ func Put(ctx context.Context, tx *sql.Tx, r Record) error {
 		r.Raw = node.bytes()
 	}
 	if r.Account == "" {
-		return errors.New("missing account identity")
+		return 0, errors.New("missing account identity")
 	}
 	if r.Observed == 0 {
 		r.Observed = time.Now().UnixMilli()
 	}
 	version, err := putVersion(ctx, tx, r.Account, r.Table, node)
+	versionID = version
 	if err != nil {
-		return err
+		return versionID, err
 	}
 	contextID := r.Context
-	if col := ownerColumn(r.Table); col != "" {
+	if col := ownerColumn(r.Table); col != "" && contextID == "" {
 		var owner sql.NullInt64
 		if err = tx.QueryRowContext(ctx, `SELECT `+col+` FROM source_versions WHERE version_id=?`, version).Scan(&owner); err != nil {
-			return err
+			return versionID, err
 		}
 		if owner.Valid {
 			var canonical int64
 			if err = tx.QueryRowContext(ctx, `SELECT coalesce(merged_into,entity_id) FROM `+r.Table+` WHERE account_id=? AND entity_id=?`, r.Account, owner.Int64).Scan(&canonical); err != nil {
-				return err
+				return versionID, err
 			}
 			contextID += fmt.Sprintf(":%s:%d", r.Table, canonical)
 		} else {
@@ -242,30 +253,36 @@ func Put(ctx context.Context, tx *sql.Tx, r Record) error {
 		hash = Hash(r.Raw)
 	}
 	var previous, oldVersion int64
-	var oldHash string
 	if event != "" {
-		err = tx.QueryRowContext(ctx, `SELECT observation_id,version_id,source_hash FROM source_observations WHERE account_id=? AND event_identity=?`, r.Account, event).Scan(&previous, &oldVersion, &oldHash)
+		err = tx.QueryRowContext(ctx, `SELECT observation_id,version_id FROM source_observations WHERE account_id=? AND event_identity=?`, r.Account, event).Scan(&previous, &oldVersion)
 		if err == nil && oldVersion != version {
 			// Preserve conflicting event payloads while leaving the original sequence
 			// identity and checkpoint intact. Repeated conflicts reuse their evidence.
-			conflict := event + ":conflict:" + hash
+			conflict := fmt.Sprintf("%s:conflict:%d", event, version)
 			if _, err = tx.ExecContext(ctx, `INSERT INTO source_observations(account_id,version_id,origin,context,acquired_thread_id,source_hash,observed_at_ms,last_observed_at_ms,event_identity) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(account_id,event_identity) WHERE event_identity!='' DO UPDATE SET last_observed_at_ms=max(last_observed_at_ms,excluded.last_observed_at_ms)`, r.Account, version, r.Origin, contextID, r.Thread, hash, r.Observed, r.Observed, conflict); err != nil {
-				return err
+				return versionID, err
 			}
-			return SaveState(ctx, tx, r.Account, "realtime", "conflict", State{Error: "conflicting payloads for a source event sequence; checkpoint blocked"})
+			return versionID, SaveState(ctx, tx, r.Account, "realtime", "conflict", map[string]any{"error": "conflicting payloads for a source event sequence; checkpoint blocked", "source_reference": SourceRef(Record{Account: r.Account, Table: r.Table, RowID: version})})
 		}
 	} else {
-		err = tx.QueryRowContext(ctx, `SELECT observation_id,version_id,source_hash FROM source_observations WHERE account_id=? AND origin=? AND context=? ORDER BY observation_id DESC LIMIT 1`, r.Account, r.Origin, contextID).Scan(&previous, &oldVersion, &oldHash)
+		err = tx.QueryRowContext(ctx, `SELECT observation_id,version_id FROM source_observations WHERE account_id=? AND origin=? AND context=? ORDER BY observation_id DESC LIMIT 1`, r.Account, r.Origin, contextID).Scan(&previous, &oldVersion)
 	}
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return err
+		return versionID, err
 	}
-	if err == nil && oldVersion == version && (oldHash == hash || event != "") {
+	refresh := false
+	if err == nil && oldVersion == version && event == "" {
+		refresh, err = newerSnapshotEvidence(ctx, tx, r.Account, contextID, r.Origin, version, previous)
+		if err != nil {
+			return versionID, err
+		}
+	}
+	if err == nil && oldVersion == version && !refresh {
 		_, err = tx.ExecContext(ctx, `UPDATE source_observations SET last_observed_at_ms=max(last_observed_at_ms,?) WHERE observation_id=?`, r.Observed, previous)
-		return err
+		return versionID, err
 	}
 	_, err = tx.ExecContext(ctx, `INSERT INTO source_observations(account_id,version_id,origin,context,acquired_thread_id,source_hash,observed_at_ms,last_observed_at_ms,event_identity) VALUES(?,?,?,?,?,?,?,?,?)`, r.Account, version, r.Origin, contextID, r.Thread, hash, r.Observed, r.Observed, event)
-	return err
+	return versionID, err
 }
 
 func SaveState(ctx context.Context, tx *sql.Tx, account, scope, id string, state any) error {
@@ -276,16 +293,22 @@ func SaveState(ctx context.Context, tx *sql.Tx, account, scope, id string, state
 	_, err = tx.ExecContext(ctx, `INSERT INTO sync_state VALUES(?,?,?,?) ON CONFLICT(account_id,scope,scope_id) DO UPDATE SET state=excluded.state`, account, scope, id, string(b))
 	return err
 }
-func (s *Store) State(ctx context.Context, account, scope, id string, out any) error {
+func (s *Store) State(ctx context.Context, account, scope, id string, out *State) error {
 	var b string
 	err := s.queryRowContext(ctx, `SELECT state FROM sync_state WHERE account_id=? AND scope=? AND scope_id=?`, account, scope, id).Scan(&b)
 	if errors.Is(err, sql.ErrNoRows) {
+		*out = State{}
 		return nil
 	}
 	if err != nil {
 		return err
 	}
-	return json.Unmarshal([]byte(b), out)
+	var decoded State
+	if err := json.Unmarshal([]byte(b), &decoded); err != nil {
+		return err
+	}
+	*out = decoded
+	return nil
 }
 func (s *Store) Transaction(ctx context.Context, fn func(*sql.Tx) error) error {
 	tx, err := s.DB.BeginTx(ctx, nil)
@@ -338,14 +361,46 @@ func (s *Store) Status(ctx context.Context, account string) ([]map[string]any, e
 }
 
 // ReadState reads on the same transaction that stores observations/checkpoints.
-func ReadState(ctx context.Context, tx *sql.Tx, account, scope, id string, out any) error {
+func ReadState(ctx context.Context, tx *sql.Tx, account, scope, id string, out *State) error {
 	var raw string
 	err := tx.QueryRowContext(ctx, `SELECT state FROM sync_state WHERE account_id=? AND scope=? AND scope_id=?`, account, scope, id).Scan(&raw)
 	if errors.Is(err, sql.ErrNoRows) {
+		*out = State{}
 		return nil
 	}
 	if err != nil {
 		return err
 	}
-	return json.Unmarshal([]byte(raw), out)
+	var decoded State
+	if err := json.Unmarshal([]byte(raw), &decoded); err != nil {
+		return err
+	}
+	*out = decoded
+	return nil
+}
+
+// An unchanged root can be new evidence after another fetch observed different
+// versions of a shared entity. Compare the latest observed version sets, not
+// polling order or mutable timestamps. Unrelated fetches do not allocate rows.
+func newerSnapshotEvidence(ctx context.Context, tx *sql.Tx, account, contextID, origin string, version, previous int64) (bool, error) {
+	partial := strings.HasSuffix(origin, ":partial")
+	var changed bool
+	err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM source_observations WHERE account_id=? AND context=? AND observation_id=(SELECT max(observation_id) FROM source_observations WHERE account_id=? AND context=?) AND observation_id>? AND (version_id!=? OR (origin LIKE '%:partial')!=?))`, account, contextID, account, contextID, previous, version, partial).Scan(&changed)
+	if err != nil || changed {
+		return changed, err
+	}
+	err = tx.QueryRowContext(ctx, `WITH RECURSIVE
+ candidate(id) AS (SELECT ? UNION SELECT r.child_id FROM source_relations r JOIN candidate c ON r.parent_id=c.id WHERE r.child_id IS NOT NULL),
+ recent(observation_id,id) AS (SELECT observation_id,version_id FROM source_observations WHERE account_id=? AND observation_id>? UNION SELECT n.observation_id,r.child_id FROM recent n JOIN source_relations r ON r.parent_id=n.id WHERE r.child_id IS NOT NULL),
+ owned AS (SELECT v.version_id,v.kind,CASE v.kind
+ WHEN 'users' THEN (SELECT coalesce(merged_into,entity_id) FROM users WHERE account_id=v.account_id AND entity_id=v.user_entity_id)
+ WHEN 'threads' THEN (SELECT coalesce(merged_into,entity_id) FROM threads WHERE account_id=v.account_id AND entity_id=v.thread_entity_id)
+ WHEN 'messages' THEN (SELECT coalesce(merged_into,entity_id) FROM messages WHERE account_id=v.account_id AND entity_id=v.message_entity_id)
+ END AS entity_id FROM source_versions v WHERE v.version_id IN (SELECT id FROM candidate UNION SELECT id FROM recent)),
+ subjects AS (SELECT DISTINCT o.kind,o.entity_id FROM owned o JOIN candidate c ON c.id=o.version_id WHERE o.entity_id IS NOT NULL),
+ latest AS (SELECT s.kind,s.entity_id,max(n.observation_id) AS observation_id FROM subjects s JOIN owned o ON o.kind=s.kind AND o.entity_id=s.entity_id JOIN recent n ON n.id=o.version_id GROUP BY s.kind,s.entity_id)
+ SELECT EXISTS(SELECT 1 FROM latest l JOIN source_observations p ON p.observation_id=l.observation_id WHERE (p.origin LIKE '%:partial')!=?
+ OR EXISTS(SELECT 1 FROM owned o JOIN candidate c ON c.id=o.version_id WHERE o.kind=l.kind AND o.entity_id=l.entity_id AND NOT EXISTS(SELECT 1 FROM recent n WHERE n.observation_id=l.observation_id AND n.id=c.id))
+ OR EXISTS(SELECT 1 FROM owned o JOIN recent n ON n.id=o.version_id WHERE n.observation_id=l.observation_id AND o.kind=l.kind AND o.entity_id=l.entity_id AND NOT EXISTS(SELECT 1 FROM candidate c WHERE c.id=n.id)))`, version, account, previous, partial).Scan(&changed)
+	return changed, err
 }
