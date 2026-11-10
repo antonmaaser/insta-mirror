@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -254,30 +255,40 @@ func (s *Server) Run(ctx context.Context, address, tokenFile string, allowNetwor
 	if !loopback && !allowNetwork {
 		return errors.New("non-loopback HTTP requires --allow-network")
 	}
-	info, err := os.Lstat(tokenFile)
-	if err != nil {
-		return errors.New("HTTP requires --http-token-file")
+	requireToken := tokenFile != ""
+	if !loopback && !requireToken {
+		return errors.New("non-loopback HTTP requires --http-token-file")
 	}
-	if !info.Mode().IsRegular() || info.Mode().Perm()&0077 != 0 || info.Size() > 4096 {
-		return errors.New("HTTP token file must be a small owner-only regular file")
+	var expected [sha256.Size]byte
+	if requireToken {
+		info, err := os.Lstat(tokenFile)
+		if err != nil {
+			return fmt.Errorf("inspect HTTP token file: %w", err)
+		}
+		if !info.Mode().IsRegular() || info.Mode().Perm()&0077 != 0 || info.Size() > 4096 {
+			return errors.New("HTTP token file must be a small owner-only regular file")
+		}
+		token, err := os.ReadFile(tokenFile)
+		if err != nil {
+			return err
+		}
+		trimmed := bytes.TrimSpace(token)
+		if len(trimmed) < 32 {
+			clear(token)
+			return errors.New("HTTP token must contain at least 32 bytes")
+		}
+		expected = sha256.Sum256(trimmed)
+		clear(token)
 	}
-	token, err := os.ReadFile(tokenFile)
-	if err != nil {
-		return err
-	}
-	token = []byte(strings.TrimSpace(string(token)))
-	if len(token) < 32 {
-		return errors.New("HTTP token must contain at least 32 bytes")
-	}
-	expected := sha256.Sum256(token)
-	clear(token)
 	handler := sdk.NewStreamableHTTPHandler(func(*http.Request) *sdk.Server { return s.SDK }, nil)
-	protected := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		auth := r.Header.Get("Authorization")
-		presented := sha256.Sum256([]byte(strings.TrimPrefix(auth, "Bearer ")))
-		if !strings.HasPrefix(auth, "Bearer ") || subtle.ConstantTimeCompare(expected[:], presented[:]) != 1 {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
-			return
+	mcpHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if requireToken {
+			value, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+			presented := sha256.Sum256([]byte(value))
+			if !ok || subtle.ConstantTimeCompare(expected[:], presented[:]) != 1 {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
 		}
 		if origin := r.Header.Get("Origin"); origin != "" && origin != "http://"+r.Host && origin != "https://"+r.Host {
 			http.Error(w, "origin denied", http.StatusForbidden)
@@ -293,7 +304,7 @@ func (s *Server) Run(ctx context.Context, address, tokenFile string, allowNetwor
 	if err != nil {
 		return err
 	}
-	server := &http.Server{Handler: protected, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 90 * time.Second, MaxHeaderBytes: 16384}
+	server := &http.Server{Handler: mcpHandler, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 90 * time.Second, MaxHeaderBytes: 16384}
 	done := make(chan error, 1)
 	go func() { done <- server.Serve(listener) }()
 	select {

@@ -64,7 +64,7 @@ func Run(ctx context.Context, args []string) (runErr error) {
 	once := fs.Bool("once", false, "finish pending historical work and exit")
 	follow := fs.Bool("follow", false, "maintain realtime synchronization")
 	httpAddress := fs.String("http", "", "optional MCP HTTP listen address, e.g. 127.0.0.1:8080")
-	httpToken := fs.String("http-token-file", "", "owner-only MCP bearer token file")
+	httpToken := fs.String("http-token-file", "", "owner-only MCP bearer token file (required for non-loopback HTTP)")
 	allowNetwork := fs.Bool("allow-network", false, "allow explicit HTTP network exposure")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
