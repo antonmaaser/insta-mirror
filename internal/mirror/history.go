@@ -362,7 +362,9 @@ func (e *Engine) Initialize(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		if viewer == nil || viewer.Data.Fbid != e.Account {
+		// The mirror account is the Instagram user ID from ds_user_id.
+		// The viewer's FBID belongs to a separate ID namespace.
+		if viewer == nil || viewer.GetUserId() != e.Account {
 			return acquisitionError{errors.New("authenticated viewer does not match mirror account")}
 		}
 
