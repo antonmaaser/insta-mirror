@@ -109,12 +109,13 @@ func addAlias(out []store.Alias, ns, scope, value string) []store.Alias {
 }
 
 type ingestion struct {
-	ctx       context.Context
-	tx        *sql.Tx
-	account   string
-	fill      bool
-	event     int64
-	decisions []store.Decision
+	ctx          context.Context
+	tx           *sql.Tx
+	account      string
+	fill         bool
+	inboxPreview bool
+	event        int64
+	decisions    []store.Decision
 }
 
 func (b *ingestion) resolve(kind string, aliases []store.Alias, primary string, expected int64) (int64, bool, bool, error) {
@@ -574,6 +575,8 @@ func (b *ingestion) sender(o sourceObject, fill bool) (int64, error) {
 	return b.user(profile, igid, fbid, sender.id("name"), fill)
 }
 
+const reactionNoticeKind = "REACTION_ACTION_LOG"
+
 var messageFields = map[string]string{
 	"timestamp_ms": "sent_at", "text_body": "body", "content_type": "kind", "igd_snippet": "snippet",
 	"expiration_timestamp_ms": "expires_at", "view_expiration_timestamp_ms": "view_expires_at",
@@ -630,11 +633,24 @@ func (b *ingestion) message(raw json.RawMessage, thread int64, quote bool) (int6
 	fill := b.fill || quote
 	var deleted, placeholder int64
 	var edited sql.NullInt64
-	if err = b.tx.QueryRowContext(b.ctx, "SELECT coalesce(deleted,0),placeholder,edited_at FROM messages WHERE id=?", id).Scan(&deleted, &placeholder, &edited); err != nil {
+	var storedKind sql.NullString
+	if err = b.tx.QueryRowContext(b.ctx, "SELECT coalesce(deleted,0),placeholder,edited_at,kind FROM messages WHERE id=?", id).Scan(&deleted, &placeholder, &edited, &storedKind); err != nil {
 		return 0, err
 	}
 	if deleted != 0 {
 		b.decision("messages", id, created, bound, fields)
+		return id, nil
+	}
+	if storedKind.String == reactionNoticeKind || string(field(o["content"], "is_reaction_action_log")) == "true" {
+		// Preserve the local ID for pagination and reaction references. This
+		// source notice never establishes the target or the reaction value.
+		more, err := b.patch("messages", id, map[string]any{
+			"kind": reactionNoticeKind, "placeholder": int64(1), "body": nil, "snippet": nil,
+		}, false)
+		if err != nil {
+			return 0, err
+		}
+		b.decision("messages", id, created, bound, append(fields, more...))
 		return id, nil
 	}
 	values, err := o.fields(messageFields)
@@ -830,6 +846,11 @@ func (b *ingestion) messageRelations(id, thread int64, o sourceObject, fill bool
 				}
 				seen[user] = true
 			}
+			if b.inboxPreview {
+				// A preview can supply individual reactions, even though it
+				// provides no complete list or evidence of removals.
+				continue
+			}
 			rows, err := b.tx.QueryContext(b.ctx, "SELECT user_id FROM message_reactions WHERE message_id=?", id)
 			if err != nil {
 				return err
@@ -947,6 +968,10 @@ func (b *ingestion) reaction(msg, thread int64, raw json.RawMessage, remove bool
 	var exists bool
 	if err = b.tx.QueryRowContext(b.ctx, "SELECT EXISTS(SELECT 1 FROM message_reactions WHERE message_id=? AND user_id=?)", msg, user).Scan(&exists); err != nil {
 		return 0, err
+	}
+	if b.inboxPreview && exists {
+		b.ignored("message_reactions", msg, []string{"reaction"})
+		return user, nil
 	}
 	var result sql.Result
 	if remove {

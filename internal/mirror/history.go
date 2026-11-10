@@ -250,9 +250,9 @@ func (b *ingestion) inboxThread(raw json.RawMessage, pinned bool) (int64, error)
 		}
 		b.decision("threads", thread, false, false, fields)
 	}
-	prior := b.fill
-	b.fill = true
-	defer func() { b.fill = prior }()
+	priorFill, priorPreview := b.fill, b.inboxPreview
+	b.fill, b.inboxPreview = true, true
+	defer func() { b.fill, b.inboxPreview = priorFill, priorPreview }()
 	if rawMessages := field(raw, "as_ig_direct_thread", "slide_messages", "edges"); object(rawMessages) {
 		var edges []struct {
 			Node json.RawMessage `json:"node"`
