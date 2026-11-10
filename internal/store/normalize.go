@@ -6,7 +6,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"math/big"
 	"sort"
 	"strings"
@@ -231,42 +230,88 @@ func (n *sourceNode) bytes() []byte {
 	return b.Bytes()
 }
 
+// Paths use member ordinals (including duplicate keys) and array positions.
+// A null hole in the residual is replaced only when a child relation exists.
 type sourceLink struct {
-	slot       int
-	key        string
-	encodedKey string
-	child      int64
+	path          []int
+	field         string
+	child, source int64
 }
 
-// Named kinds follow the upstream source vocabulary. Unrecognized composite
-// fields are decomposed too, so future fields do not require a schema change.
-func nestedKind(parent, field string, arrayElement bool) string {
-	if arrayElement {
-		return parent
+func pathAppend(path []int, i int) []int { return append(append([]int(nil), path...), i) }
+func joinField(parent, field string) string {
+	if parent == "" {
+		return field
 	}
+	return parent + "." + field
+}
+
+func extractedKind(owner, field string) string {
 	switch field {
-	case "users", "viewer", "user_dict", "usersWithoutViewer":
-		return "users"
-	case "message", "replied_to_message", "pinned_messages", "node":
-		return "messages"
+	case "users", "viewer", "user_dict", "usersWithoutViewer", "group_creator":
+		if owner == "threads" || owner == "messages" || owner == "deltas" {
+			return "users"
+		}
+	case "message", "replied_to_message", "pinned_messages":
+		if owner == "messages" || owner == "deltas" || owner == "threads" {
+			return "messages"
+		}
+	case "node":
+		if owner == "threads" {
+			return "messages"
+		}
 	case "as_ig_direct_thread":
 		return "threads"
+	case "content":
+		if owner == "messages" {
+			return "content"
+		}
+	case "xma":
+		if owner == "content" {
+			return "xma"
+		}
 	case "attachments", "attachment", "videos", "ordered_photo_video_attachments", "audio_attachments", "animated_media":
 		return "attachments"
-	case "reactions", "reaction":
+	case "reactions", "reaction", "msg_reactions":
 		return "reactions"
 	case "mentions":
 		return "mentions"
 	case "slide_edit_history":
 		return "edit_history"
-	default:
-		return field
+	case "slide_read_receipts", "read_receipt":
+		return "read_receipts"
+	case "nicknames":
+		return "nicknames"
+	case "preview_image", "xmaPreviewImage", "header_icon":
+		if owner == "content" || owner == "xma" {
+			return "media_descriptors"
+		}
 	}
+	return ""
+}
+func referenceKind(owner, field string, n *sourceNode) (string, string) {
+	switch field {
+	case "thread_fbid":
+		return "threads", "thread_fbid"
+	case "sender_fbid", "participant_fbid", "actor_fbid", "left_participant_fbid", "viewer_fbid", "eimu_id":
+		return "users", field
+	case "replied_to_message_id", "log_message_id":
+		return "messages", field
+	case "message_id":
+		if owner == "deltas" {
+			return "messages", field
+		}
+	case "user_fbid":
+		if nodeValue(n, "profile_range_type") == "PROFILE" {
+			return "users", "sender_fbid"
+		}
+	}
+	return "", ""
 }
 
 func putVersion(ctx context.Context, tx *sql.Tx, account, kind string, n *sourceNode) (int64, error) {
 	canonical := n.bytes()
-	fingerprint := "v1:" + Hash(canonical)
+	fingerprint := "v2:" + Hash(canonical)
 	var id int64
 	err := tx.QueryRowContext(ctx, `SELECT version_id FROM source_versions WHERE account_id=? AND kind=? AND content_hash=?`, account, kind, fingerprint).Scan(&id)
 	if err == nil {
@@ -282,36 +327,118 @@ func putVersion(ctx context.Context, tx *sql.Tx, account, kind string, n *source
 	if !errors.Is(err, sql.ErrNoRows) {
 		return 0, err
 	}
-	residual := &sourceNode{shape: n.shape}
-	var links []sourceLink
-	if n.shape == '{' {
-		for slot, m := range n.members {
-			if m.value.shape == 0 {
-				residual.members = append(residual.members, m)
-				continue
-			}
-			child, err := putVersion(ctx, tx, account, nestedKind(kind, m.key, false), m.value)
-			if err != nil {
-				return 0, err
-			}
-			links = append(links, sourceLink{slot: slot, key: m.key, encodedKey: m.encodedKey, child: child})
+	var owner int64
+	var ownIDs []int64
+	identityError := ""
+	if ownerColumn(kind) != "" {
+		owner, ownIDs, err = resolveAliases(ctx, tx, account, kind, aliases(kind, n))
+		if errors.Is(err, errIdentityConflict) {
+			identityError = err.Error()
+		} else if err != nil {
+			return 0, err
 		}
-	} else if n.shape == '[' {
-		for slot, v := range n.elements {
-			if v.shape == 0 {
-				residual.elements = append(residual.elements, v)
-				continue
-			}
-			child, err := putVersion(ctx, tx, account, nestedKind(kind, "", true), v)
-			if err != nil {
-				return 0, err
-			}
-			links = append(links, sourceLink{slot: slot, child: child})
-		}
-	} else {
-		return 0, errors.New("source version must be an object or array")
 	}
-	result, err := tx.ExecContext(ctx, `INSERT INTO source_versions(account_id,kind,content_hash,residual) VALUES(?,?,?,?)`, account, kind, fingerprint, string(residual.bytes()))
+	var links []sourceLink
+	var walk func(*sourceNode, []int, string, string) (*sourceNode, error)
+	walk = func(node *sourceNode, path []int, field, extract string) (*sourceNode, error) {
+		if node.shape == '{' && extract != "" {
+			child, err := putVersion(ctx, tx, account, extract, node)
+			if err != nil {
+				return nil, err
+			}
+			links = append(links, sourceLink{path: path, field: field, child: child})
+			return &sourceNode{scalar: json.RawMessage("null")}, nil
+		}
+		residual := &sourceNode{shape: node.shape, scalar: node.scalar}
+		if node.shape == '{' {
+			// A sender wrapper or nickname explicitly pairs IG and messaging IDs,
+			// but does not require another user/profile content record.
+			if field == "sender" || kind == "nicknames" {
+				igKey, msgKey := "igid", "eimu_id"
+				if field == "sender" {
+					msgKey = "id"
+				}
+				var paired []sourceAlias
+				if v := nodeValue(node, igKey); v != "" {
+					paired = append(paired, sourceAlias{"user.igid", "", v, joinField(field, igKey)})
+				}
+				if v := nodeValue(node, msgKey); v != "" {
+					paired = append(paired, sourceAlias{"user.messaging_fbid", "", v, joinField(field, msgKey)})
+				}
+				if len(paired) > 1 {
+					_, _, err := resolveAliases(ctx, tx, account, "users", paired)
+					if err != nil && !errors.Is(err, errIdentityConflict) {
+						return nil, err
+					}
+					if err != nil {
+						identityError = err.Error()
+					}
+				}
+			}
+			for i, m := range node.members {
+				p := pathAppend(path, i)
+				f := joinField(field, m.key)
+				extractKind := extractedKind(kind, m.key)
+				if m.key == "node" && f != "slide_messages.edges.node" {
+					extractKind = ""
+				}
+				child, err := walk(m.value, p, f, extractKind)
+				if err != nil {
+					return nil, err
+				}
+				residual.members = append(residual.members, sourceMember{key: m.key, encodedKey: m.encodedKey, value: child})
+				if m.value.shape == 0 {
+					rk, rf := referenceKind(kind, m.key, node)
+					if field == "sender" {
+						if m.key == "id" {
+							rk, rf = "users", "sender_fbid"
+						} else if m.key == "igid" {
+							rk, rf = "users", "id"
+						}
+					}
+					if rk != "" {
+						if value := nodeID(m.value); value != "" {
+							a := sourceAlias{identifierNamespace(rk, rf), "", value, f}
+							_, ids, err := resolveAliases(ctx, tx, account, rk, []sourceAlias{a})
+							if err != nil {
+								return nil, err
+							}
+							links = append(links, sourceLink{path: p, field: f, source: ids[0]})
+						}
+					}
+				}
+			}
+		} else if node.shape == '[' {
+			for i, v := range node.elements {
+				child, err := walk(v, pathAppend(path, i), field, extract)
+				if err != nil {
+					return nil, err
+				}
+				residual.elements = append(residual.elements, child)
+			}
+		}
+		return residual, nil
+	}
+	residual, err := walk(n, nil, "", "")
+	if err != nil {
+		return 0, err
+	}
+	var u, t, m any
+	switch kind {
+	case "users":
+		if owner != 0 {
+			u = owner
+		}
+	case "threads":
+		if owner != 0 {
+			t = owner
+		}
+	case "messages":
+		if owner != 0 {
+			m = owner
+		}
+	}
+	result, err := tx.ExecContext(ctx, `INSERT INTO source_versions(account_id,kind,user_entity_id,thread_entity_id,message_entity_id,content_hash,residual,identity_error) VALUES(?,?,?,?,?,?,?,?)`, account, kind, u, t, m, fingerprint, string(residual.bytes()), identityError)
 	if err != nil {
 		return 0, err
 	}
@@ -320,7 +447,24 @@ func putVersion(ctx context.Context, tx *sql.Tx, account, kind string, n *source
 		return 0, err
 	}
 	for _, l := range links {
-		if _, err = tx.ExecContext(ctx, `INSERT INTO source_links(account_id,parent_id,slot,field,encoded_key,child_id) VALUES(?,?,?,?,?,?)`, account, id, l.slot, l.key, l.encodedKey, l.child); err != nil {
+		path, _ := json.Marshal(l.path)
+		var child, source any
+		if l.child != 0 {
+			child = l.child
+		} else {
+			source = l.source
+		}
+		if _, err = tx.ExecContext(ctx, `INSERT INTO source_relations(account_id,parent_id,path,field,child_id,source_id) VALUES(?,?,?,?,?,?)`, account, id, string(path), l.field, child, source); err != nil {
+			return 0, err
+		}
+		if l.source != 0 {
+			if _, err = tx.ExecContext(ctx, `UPDATE source_ids SET evidence_version_id=?,evidence_field=? WHERE source_id=? AND evidence_version_id IS NULL`, id, l.field, l.source); err != nil {
+				return 0, err
+			}
+		}
+	}
+	for _, alias := range ownIDs {
+		if _, err = tx.ExecContext(ctx, `UPDATE source_ids SET evidence_version_id=? WHERE source_id=? AND evidence_version_id IS NULL`, id, alias); err != nil {
 			return 0, err
 		}
 	}
@@ -331,13 +475,11 @@ type sourceQuerier interface {
 	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
 }
 
-// One recursive query loads a version graph. Reconstruction does not require
-// additional connections while a read snapshot is held.
 func reconstruct(ctx context.Context, q sourceQuerier, account string, id int64) ([]byte, error) {
 	rows, err := q.QueryContext(ctx, `WITH RECURSIVE graph(id) AS (
  SELECT version_id FROM source_versions WHERE account_id=? AND version_id=?
- UNION SELECT l.child_id FROM source_links l JOIN graph g ON l.parent_id=g.id WHERE l.account_id=?
- ) SELECT v.version_id,v.residual,l.slot,l.field,l.encoded_key,l.child_id FROM graph g JOIN source_versions v ON v.version_id=g.id LEFT JOIN source_links l ON l.parent_id=v.version_id AND l.account_id=v.account_id ORDER BY v.version_id,l.slot`, account, id, account)
+ UNION SELECT r.child_id FROM source_relations r JOIN graph g ON r.parent_id=g.id WHERE r.account_id=? AND r.child_id IS NOT NULL
+ ) SELECT v.version_id,v.residual,r.path,r.child_id FROM graph g JOIN source_versions v ON v.version_id=g.id LEFT JOIN source_relations r ON r.parent_id=v.version_id AND r.child_id IS NOT NULL ORDER BY v.version_id,r.path`, account, id, account)
 	if err != nil {
 		return nil, err
 	}
@@ -346,9 +488,9 @@ func reconstruct(ctx context.Context, q sourceQuerier, account string, id int64)
 	for rows.Next() {
 		var vid int64
 		var residual string
-		var slot, child sql.NullInt64
-		var field, encodedKey sql.NullString
-		if err = rows.Scan(&vid, &residual, &slot, &field, &encodedKey, &child); err != nil {
+		var path sql.NullString
+		var child sql.NullInt64
+		if err = rows.Scan(&vid, &residual, &path, &child); err != nil {
 			rows.Close()
 			return nil, err
 		}
@@ -360,7 +502,12 @@ func reconstruct(ctx context.Context, q sourceQuerier, account string, id int64)
 			}
 		}
 		if child.Valid {
-			links[vid] = append(links[vid], sourceLink{slot: int(slot.Int64), key: field.String, encodedKey: encodedKey.String, child: child.Int64})
+			var p []int
+			if err = json.Unmarshal([]byte(path.String), &p); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			links[vid] = append(links[vid], sourceLink{path: p, child: child.Int64})
 		}
 	}
 	err = rows.Err()
@@ -382,30 +529,28 @@ func reconstruct(ctx context.Context, q sourceQuerier, account string, id int64)
 			return errors.New("cyclic normalized source")
 		}
 		active[vid] = true
-		n := nodes[vid]
-		if n == nil {
-			return errors.New("missing normalized child")
-		}
 		for _, l := range links[vid] {
 			if err := build(l.child); err != nil {
 				return err
 			}
-			if n.shape == '{' {
-				if l.slot < 0 || l.slot > len(n.members) {
-					return fmt.Errorf("invalid source member slot %d", l.slot)
+			n := nodes[vid]
+			if n == nil || nodes[l.child] == nil {
+				return errors.New("missing normalized source")
+			}
+			for i, slot := range l.path {
+				var dest **sourceNode
+				if n.shape == '{' && slot >= 0 && slot < len(n.members) {
+					dest = &n.members[slot].value
+				} else if n.shape == '[' && slot >= 0 && slot < len(n.elements) {
+					dest = &n.elements[slot]
+				} else {
+					return errors.New("invalid normalized source location")
 				}
-				n.members = append(n.members, sourceMember{})
-				copy(n.members[l.slot+1:], n.members[l.slot:])
-				n.members[l.slot] = sourceMember{key: l.key, encodedKey: l.encodedKey, value: nodes[l.child]}
-			} else if n.shape == '[' {
-				if l.slot < 0 || l.slot > len(n.elements) {
-					return fmt.Errorf("invalid source element slot %d", l.slot)
+				if i == len(l.path)-1 {
+					*dest = nodes[l.child]
+				} else {
+					n = *dest
 				}
-				n.elements = append(n.elements, nil)
-				copy(n.elements[l.slot+1:], n.elements[l.slot:])
-				n.elements[l.slot] = nodes[l.child]
-			} else {
-				return errors.New("invalid normalized container")
 			}
 		}
 		delete(active, vid)
@@ -425,19 +570,29 @@ func (s *Store) hydrate(ctx context.Context, r *Record) error {
 	} else {
 		r.Raw, err = reconstruct(ctx, s.DB, r.Account, r.Version)
 	}
-	r.Representation = "reconstructed_source"
 	if err != nil {
 		return err
 	}
-	rows, err := s.queryContext(ctx, `SELECT p.origin,p.acquired_thread_id,p.source_hash,p.observed_at_ms,p.last_observed_at_ms FROM source_acquisitions p JOIN source_records r ON r.record_id=p.record_id WHERE r.account_id=? AND r.record_id=? ORDER BY p.acquisition_id`, r.Account, r.RowID)
+	r.Representation = "reconstructed_source"
+	if ownerColumn(r.Table) != "" {
+		if err = s.queryRowContext(ctx, `SELECT entity_id FROM `+r.Table+`_versions WHERE account_id=? AND version_id=?`, r.Account, r.Version).Scan(&r.Entity); err != nil {
+			return err
+		}
+		r.EntityReference = EntityRef(*r)
+	}
+	rows, err := s.queryContext(ctx, `SELECT DISTINCT o.observation_id,o.origin,o.acquired_thread_id,o.source_hash,o.observed_at_ms,o.last_observed_at_ms FROM source_evidence e JOIN source_observations o ON o.observation_id=e.observation_id WHERE e.account_id=? AND e.version_id=? AND (?=0 OR o.observation_id<=?) ORDER BY o.observation_id DESC LIMIT 33`, r.Account, r.Version, r.watermark, r.watermark)
 	if err != nil {
 		return err
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var a Acquisition
-		if err = rows.Scan(&a.Origin, &a.Thread, &a.Hash, &a.Observed, &a.LastObserved); err != nil {
+		if err = rows.Scan(&a.ID, &a.Origin, &a.Thread, &a.Hash, &a.Observed, &a.LastObserved); err != nil {
 			return err
+		}
+		if len(r.Acquisitions) == 32 {
+			r.AcquisitionsTruncated = true
+			break
 		}
 		r.Acquisitions = append(r.Acquisitions, a)
 	}

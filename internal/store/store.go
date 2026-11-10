@@ -21,24 +21,31 @@ type Store struct {
 }
 
 type Record struct {
-	Table          string          `json:"kind"`
-	RowID          int64           `json:"record_id"`
-	Account        string          `json:"account_id"`
-	Identity       string          `json:"source_identity"`
-	Thread         string          `json:"acquired_thread_id,omitempty"`
-	Origin         string          `json:"origin"`
-	Observed       int64           `json:"observed_at_ms"`
-	LastObserved   int64           `json:"last_observed_at_ms"`
-	Hash           string          `json:"source_hash"`
-	Raw            json.RawMessage `json:"raw,omitempty"`
-	Version        int64           `json:"-"`
-	ContentHash    string          `json:"normalized_content_hash"`
-	Representation string          `json:"representation"`
-	Acquisitions   []Acquisition   `json:"acquisitions,omitempty"`
+	Table                 string `json:"kind"`
+	Entity                int64  `json:"entity_id,omitempty"`
+	EntityReference       string `json:"entity_reference,omitempty"`
+	Observation           int64  `json:"observation_id,omitempty"`
+	AcquisitionsTruncated bool   `json:"acquisitions_truncated,omitempty"`
+	Context               string `json:"-"`
+	watermark             int64
+	RowID                 int64           `json:"record_id"`
+	Account               string          `json:"account_id"`
+	Identity              string          `json:"source_identity"`
+	Thread                string          `json:"acquired_thread_id,omitempty"`
+	Origin                string          `json:"origin"`
+	Observed              int64           `json:"observed_at_ms"`
+	LastObserved          int64           `json:"last_observed_at_ms"`
+	Hash                  string          `json:"source_hash"`
+	Raw                   json.RawMessage `json:"raw,omitempty"`
+	Version               int64           `json:"-"`
+	ContentHash           string          `json:"normalized_content_hash"`
+	Representation        string          `json:"representation"`
+	Acquisitions          []Acquisition   `json:"acquisitions,omitempty"`
 }
 
 // Acquisition identifies how a version was observed, independently of its content.
 type Acquisition struct {
+	ID           int64  `json:"observation_id"`
 	Origin       string `json:"origin"`
 	Thread       string `json:"acquired_thread_id,omitempty"`
 	Hash         string `json:"source_hash"`
@@ -57,7 +64,7 @@ type State struct {
 	Gaps        []string `json:"gaps,omitempty"`
 }
 
-const schemaVersion = 3
+const schemaVersion = 4
 
 func Open(path string) (*Store, error) {
 	// Reject incompatible files before permissions, journal mode, or schema change.
@@ -152,6 +159,9 @@ func Identity(table string, raw json.RawMessage) string {
 	return ""
 }
 func Hash(raw []byte) string { h := sha256.Sum256(raw); return hex.EncodeToString(h[:]) }
+
+// Put archives one acquisition root. Embedded content inherits provenance via
+// source_relations, rather than allocating an observation for every descendant.
 func Put(ctx context.Context, tx *sql.Tx, r Record) error {
 	if r.Table != "threads" && r.Table != "messages" && r.Table != "users" && r.Table != "deltas" {
 		return errors.New("invalid source table")
@@ -163,12 +173,6 @@ func Put(ctx context.Context, tx *sql.Tx, r Record) error {
 	if r.Account == "" {
 		return errors.New("missing account identity")
 	}
-	if r.Identity == "" {
-		r.Identity = Identity(r.Table, r.Raw)
-	}
-	if r.Identity == "" {
-		return fmt.Errorf("unidentifiable %s source", r.Table)
-	}
 	if r.Observed == 0 {
 		r.Observed = time.Now().UnixMilli()
 	}
@@ -176,12 +180,56 @@ func Put(ctx context.Context, tx *sql.Tx, r Record) error {
 	if err != nil {
 		return err
 	}
-	var record int64
-	err = tx.QueryRowContext(ctx, `INSERT INTO source_records(account_id,kind,source_identity,version_id,observed_at_ms,last_observed_at_ms) VALUES(?,?,?,?,?,?) ON CONFLICT(account_id,kind,source_identity,version_id) DO UPDATE SET observed_at_ms=min(observed_at_ms,excluded.observed_at_ms),last_observed_at_ms=max(last_observed_at_ms,excluded.last_observed_at_ms) RETURNING record_id`, r.Account, r.Table, r.Identity, version, r.Observed, r.Observed).Scan(&record)
-	if err != nil {
+	contextID := r.Context
+	if contextID == "" {
+		if col := ownerColumn(r.Table); col != "" {
+			var owner sql.NullInt64
+			if err = tx.QueryRowContext(ctx, `SELECT `+col+` FROM source_versions WHERE version_id=?`, version).Scan(&owner); err != nil {
+				return err
+			}
+			contextID = fmt.Sprintf("%s:%d", r.Table, owner.Int64)
+			if !owner.Valid {
+				contextID = fmt.Sprintf("version:%d", version)
+			}
+		} else {
+			contextID = r.Identity
+			if contextID == "" {
+				contextID = Identity(r.Table, r.Raw)
+			}
+		}
+	}
+	event := ""
+	if r.Table == "deltas" {
+		event = r.Identity
+		if event == "" {
+			event = Identity("deltas", r.Raw)
+		}
+	}
+	hash := Hash(r.Raw)
+	var previous, oldVersion int64
+	var oldHash string
+	if event != "" {
+		err = tx.QueryRowContext(ctx, `SELECT observation_id,version_id,source_hash FROM source_observations WHERE account_id=? AND event_identity=?`, r.Account, event).Scan(&previous, &oldVersion, &oldHash)
+		if err == nil && oldVersion != version {
+			// Preserve conflicting event payloads while leaving the original sequence
+			// identity and checkpoint intact. Repeated conflicts reuse their evidence.
+			conflict := event + ":conflict:" + hash
+			if _, err = tx.ExecContext(ctx, `INSERT INTO source_observations(account_id,version_id,origin,context,acquired_thread_id,source_hash,observed_at_ms,last_observed_at_ms,event_identity) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(account_id,event_identity) WHERE event_identity!='' DO UPDATE SET last_observed_at_ms=max(last_observed_at_ms,excluded.last_observed_at_ms)`, r.Account, version, r.Origin, contextID, r.Thread, hash, r.Observed, r.Observed, conflict); err != nil {
+				return err
+			}
+			return SaveState(ctx, tx, r.Account, "realtime", "conflict", State{Error: "conflicting payloads for a source event sequence; checkpoint blocked"})
+		}
+	} else {
+		err = tx.QueryRowContext(ctx, `SELECT observation_id,version_id,source_hash FROM source_observations WHERE account_id=? AND origin=? AND context=? ORDER BY observation_id DESC LIMIT 1`, r.Account, r.Origin, contextID).Scan(&previous, &oldVersion, &oldHash)
+	}
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
-	_, err = tx.ExecContext(ctx, `INSERT INTO source_acquisitions(record_id,origin,acquired_thread_id,source_hash,observed_at_ms,last_observed_at_ms) VALUES(?,?,?,?,?,?) ON CONFLICT(record_id,origin,acquired_thread_id,source_hash) DO UPDATE SET observed_at_ms=min(observed_at_ms,excluded.observed_at_ms),last_observed_at_ms=max(last_observed_at_ms,excluded.last_observed_at_ms)`, record, r.Origin, r.Thread, Hash(r.Raw), r.Observed, r.Observed)
+	if err == nil && oldVersion == version && (oldHash == hash || event != "") {
+		_, err = tx.ExecContext(ctx, `UPDATE source_observations SET last_observed_at_ms=max(last_observed_at_ms,?) WHERE observation_id=?`, r.Observed, previous)
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO source_observations(account_id,version_id,origin,context,acquired_thread_id,source_hash,observed_at_ms,last_observed_at_ms,event_identity) VALUES(?,?,?,?,?,?,?,?,?)`, r.Account, version, r.Origin, contextID, r.Thread, hash, r.Observed, r.Observed, event)
 	return err
 }
 

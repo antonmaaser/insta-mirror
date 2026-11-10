@@ -3,11 +3,123 @@ package store
 import (
 	"database/sql"
 	"fmt"
-	"strings"
 )
 
-// These are source indexes, not a second canonical message model. Scalar data
-// remains in the version's residual; views expose it without duplicating it.
+// Identity tables contain no second copy of source content. A version owns its
+// scalar residual and relations; wrappers and empty containers stay inline.
+func createSchema(tx *sql.Tx) error {
+	for _, kind := range []string{"users", "threads", "messages"} {
+		if _, err := tx.Exec(`CREATE TABLE ` + kind + ` (
+ entity_id INTEGER PRIMARY KEY, account_id TEXT NOT NULL, merged_into INTEGER,
+ UNIQUE(account_id,entity_id), CHECK(merged_into IS NULL OR merged_into<entity_id),
+ FOREIGN KEY(account_id,merged_into) REFERENCES ` + kind + `(account_id,entity_id));`); err != nil {
+			return err
+		}
+	}
+	_, err := tx.Exec(`
+ CREATE TABLE source_versions (
+ version_id INTEGER PRIMARY KEY, account_id TEXT NOT NULL, kind TEXT NOT NULL,
+ user_entity_id INTEGER, thread_entity_id INTEGER, message_entity_id INTEGER,
+ content_hash TEXT NOT NULL, residual TEXT NOT NULL CHECK(json_valid(residual)),
+ identity_error TEXT NOT NULL DEFAULT '',
+ CHECK((user_entity_id IS NOT NULL)+(thread_entity_id IS NOT NULL)+(message_entity_id IS NOT NULL)<=1),
+ CHECK(user_entity_id IS NULL OR kind='users'), CHECK(thread_entity_id IS NULL OR kind='threads'), CHECK(message_entity_id IS NULL OR kind='messages'),
+ UNIQUE(account_id,kind,content_hash), UNIQUE(account_id,version_id),
+ FOREIGN KEY(account_id,user_entity_id) REFERENCES users(account_id,entity_id),
+ FOREIGN KEY(account_id,thread_entity_id) REFERENCES threads(account_id,entity_id),
+ FOREIGN KEY(account_id,message_entity_id) REFERENCES messages(account_id,entity_id));
+ CREATE TABLE source_ids (
+ source_id INTEGER PRIMARY KEY, account_id TEXT NOT NULL, namespace TEXT NOT NULL, scope TEXT NOT NULL DEFAULT '', value TEXT NOT NULL,
+ user_entity_id INTEGER, thread_entity_id INTEGER, message_entity_id INTEGER,
+ evidence_version_id INTEGER, evidence_field TEXT NOT NULL DEFAULT '',
+ CHECK((user_entity_id IS NOT NULL)+(thread_entity_id IS NOT NULL)+(message_entity_id IS NOT NULL)=1),
+ UNIQUE(account_id,namespace,scope,value), UNIQUE(account_id,source_id),
+ FOREIGN KEY(account_id,user_entity_id) REFERENCES users(account_id,entity_id),
+ FOREIGN KEY(account_id,thread_entity_id) REFERENCES threads(account_id,entity_id),
+ FOREIGN KEY(account_id,message_entity_id) REFERENCES messages(account_id,entity_id),
+ FOREIGN KEY(account_id,evidence_version_id) REFERENCES source_versions(account_id,version_id));
+ CREATE INDEX ids_user ON source_ids(account_id,user_entity_id,namespace);
+ CREATE INDEX ids_thread ON source_ids(account_id,thread_entity_id,namespace);
+ CREATE INDEX ids_message ON source_ids(account_id,message_entity_id,namespace);
+ CREATE INDEX versions_user ON source_versions(account_id,user_entity_id);
+ CREATE INDEX versions_thread ON source_versions(account_id,thread_entity_id);
+ CREATE INDEX versions_message ON source_versions(account_id,message_entity_id);
+ CREATE TABLE source_relations (
+ account_id TEXT NOT NULL, parent_id INTEGER NOT NULL,
+ path TEXT NOT NULL CHECK(json_valid(path)), field TEXT NOT NULL,
+ child_id INTEGER, source_id INTEGER,
+ PRIMARY KEY(parent_id,path), CHECK((child_id IS NOT NULL)+(source_id IS NOT NULL)=1),
+ FOREIGN KEY(account_id,parent_id) REFERENCES source_versions(account_id,version_id),
+ FOREIGN KEY(account_id,child_id) REFERENCES source_versions(account_id,version_id),
+ FOREIGN KEY(account_id,source_id) REFERENCES source_ids(account_id,source_id));
+ CREATE INDEX relations_child ON source_relations(child_id,parent_id) WHERE child_id IS NOT NULL;
+ CREATE INDEX relations_source ON source_relations(source_id,parent_id) WHERE source_id IS NOT NULL;
+ CREATE INDEX relations_field ON source_relations(parent_id,field);
+ CREATE TABLE source_observations (
+ observation_id INTEGER PRIMARY KEY, account_id TEXT NOT NULL, version_id INTEGER NOT NULL,
+ origin TEXT NOT NULL, context TEXT NOT NULL, acquired_thread_id TEXT NOT NULL,
+ source_hash TEXT NOT NULL, observed_at_ms INTEGER NOT NULL, last_observed_at_ms INTEGER NOT NULL,
+ event_identity TEXT NOT NULL DEFAULT '',
+ FOREIGN KEY(account_id,version_id) REFERENCES source_versions(account_id,version_id));
+ CREATE INDEX observation_runs ON source_observations(account_id,origin,context,observation_id DESC);
+ CREATE INDEX observation_versions ON source_observations(account_id,version_id,observation_id);
+ CREATE UNIQUE INDEX observation_events ON source_observations(account_id,event_identity) WHERE event_identity!='';
+ CREATE TABLE sync_state(account_id TEXT NOT NULL,scope TEXT NOT NULL,scope_id TEXT NOT NULL,state TEXT NOT NULL CHECK(json_valid(state)),PRIMARY KEY(account_id,scope,scope_id));
+ CREATE TRIGGER immutable_versions_update BEFORE UPDATE ON source_versions BEGIN SELECT RAISE(ABORT,'source versions are immutable'); END;
+ CREATE TRIGGER immutable_versions_delete BEFORE DELETE ON source_versions BEGIN SELECT RAISE(ABORT,'source versions are immutable'); END;
+ CREATE TRIGGER immutable_relations_update BEFORE UPDATE ON source_relations BEGIN SELECT RAISE(ABORT,'source relations are immutable'); END;
+ CREATE TRIGGER immutable_relations_delete BEFORE DELETE ON source_relations BEGIN SELECT RAISE(ABORT,'source relations are immutable'); END;
+ CREATE VIEW source_evidence AS
+ WITH RECURSIVE evidence(account_id,version_id,observation_id) AS (
+ SELECT account_id,version_id,observation_id FROM source_observations
+ UNION SELECT r.account_id,r.child_id,e.observation_id FROM evidence e JOIN source_relations r ON r.account_id=e.account_id AND r.parent_id=e.version_id WHERE r.child_id IS NOT NULL
+ ) SELECT * FROM evidence;
+ CREATE VIEW source_visible AS SELECT e.account_id,e.version_id,max(e.observation_id) AS observation_id,
+ min(o.observed_at_ms) AS observed_at_ms,max(o.last_observed_at_ms) AS last_observed_at_ms
+ FROM source_evidence e JOIN source_observations o ON o.observation_id=e.observation_id GROUP BY e.account_id,e.version_id;
+ `)
+	if err != nil {
+		return err
+	}
+	for kind, fields := range indexedFields {
+		owner := "0"
+		if kind != "deltas" {
+			col := ownerColumn(kind)
+			owner = `coalesce((SELECT coalesce(merged_into,entity_id) FROM ` + kind + ` WHERE account_id=v.account_id AND entity_id=v.` + col + `),0)`
+		}
+		query := `CREATE VIEW ` + kind + `_versions AS SELECT v.*,v.version_id AS record_id,` + owner + ` AS entity_id,`
+		if kind == "deltas" {
+			query += `coalesce('uq_seq_id:'||json_extract(v.residual,'$.uq_seq_id'),'unsequenced:'||v.version_id)`
+		} else {
+			query += `'entity:'||` + owner
+		}
+		query += ` AS source_identity`
+		for _, field := range fields {
+			expr := scalarSQL("v.residual", field)
+			query += `,` + expr + ` AS ` + field
+			if _, err = tx.Exec(`CREATE INDEX versions_` + kind + `_` + field + ` ON source_versions(account_id,` + scalarSQL("residual", field) + `) WHERE kind='` + kind + `'`); err != nil {
+				return err
+			}
+		}
+		if kind == "messages" {
+			content := childResidual("v.version_id", "content")
+			query += `,json_extract(` + content + `,'$.__typename') AS content_type,json_type(` + content + `,'$.is_reaction_action_log') AS reaction_type,json_extract(` + content + `,'$.text_body') AS content_text,json_extract(` + content + `,'$.xma_text_body') AS xma_text,json_extract(` + childResidual("v.version_id", "content.xma") + `,'$.caption_body_text') AS caption_text`
+		}
+		if kind == "deltas" {
+			msg := childResidual("v.version_id", "message")
+			query += `,json_extract(` + msg + `,'$.id') AS nested_message_id,json_extract(` + msg + `,'$.message_id') AS nested_message_source_id,json_extract(` + childResidual("v.version_id", "reaction") + `,'$.log_message_id') AS reaction_log_message_id`
+		}
+		if _, err = tx.Exec(query + ` FROM source_versions v WHERE v.kind='` + kind + `'`); err != nil {
+			return err
+		}
+		if _, err = tx.Exec(`CREATE VIEW ` + kind + `_sources AS SELECT v.*,p.origin,p.acquired_thread_id,p.source_hash,p.observation_id,e.observed_at_ms,e.last_observed_at_ms FROM ` + kind + `_versions v JOIN source_visible e ON e.account_id=v.account_id AND e.version_id=v.version_id JOIN source_observations p ON p.observation_id=e.observation_id`); err != nil {
+			return err
+		}
+	}
+	_, err = tx.Exec(fmt.Sprintf("PRAGMA user_version=%d", schemaVersion))
+	return err
+}
+
 var indexedFields = map[string][]string{
 	"threads":  {"id", "thread_id", "thread_fbid", "thread_key", "thread_subtype", "system_folder", "last_activity_timestamp_ms", "thread_title"},
 	"messages": {"id", "message_id", "thread_fbid", "sender_fbid", "timestamp_ms", "replied_to_message_id", "offline_threading_id", "text_body", "igd_snippet"},
@@ -15,61 +127,9 @@ var indexedFields = map[string][]string{
 	"deltas":   {"uq_seq_id", "__typename", "thread_fbid", "message_id", "text_body"},
 }
 
-func childResidual(parent, field string) string {
-	return `(SELECT c.residual FROM source_links l JOIN source_versions c ON c.version_id=l.child_id AND c.account_id=l.account_id WHERE l.parent_id=` + parent + ` AND l.field='` + field + `' ORDER BY l.slot LIMIT 1)`
+func scalarSQL(residual, field string) string {
+	return `CASE WHEN json_type(` + residual + `,'$.` + field + `') IN ('integer','real') THEN ` + residual + ` -> '$.` + field + `' ELSE CAST(json_extract(` + residual + `,'$.` + field + `') AS TEXT) END`
 }
-func createSchema(tx *sql.Tx) error {
-	_, err := tx.Exec(`
- CREATE TABLE source_versions (
- version_id INTEGER PRIMARY KEY, account_id TEXT NOT NULL, kind TEXT NOT NULL,
- content_hash TEXT NOT NULL, residual TEXT NOT NULL CHECK(json_valid(residual) AND json_type(residual) IN ('object','array')),
- UNIQUE(account_id,kind,content_hash), UNIQUE(account_id,version_id));
- CREATE TABLE source_links (
- account_id TEXT NOT NULL, parent_id INTEGER NOT NULL, slot INTEGER NOT NULL CHECK(slot>=0), field TEXT NOT NULL, encoded_key TEXT NOT NULL, child_id INTEGER NOT NULL,
- PRIMARY KEY(parent_id,slot), FOREIGN KEY(account_id,parent_id) REFERENCES source_versions(account_id,version_id), FOREIGN KEY(account_id,child_id) REFERENCES source_versions(account_id,version_id));
- CREATE TABLE source_records (
- record_id INTEGER PRIMARY KEY, account_id TEXT NOT NULL, kind TEXT NOT NULL CHECK(kind IN ('threads','messages','users','deltas')), source_identity TEXT NOT NULL, version_id INTEGER NOT NULL,
- observed_at_ms INTEGER NOT NULL, last_observed_at_ms INTEGER NOT NULL,
- UNIQUE(account_id,kind,source_identity,version_id), UNIQUE(account_id,record_id), FOREIGN KEY(account_id,version_id) REFERENCES source_versions(account_id,version_id));
- CREATE INDEX records_account_kind ON source_records(account_id,kind,record_id);
- CREATE TABLE source_acquisitions (
- acquisition_id INTEGER PRIMARY KEY, record_id INTEGER NOT NULL REFERENCES source_records(record_id), origin TEXT NOT NULL, acquired_thread_id TEXT NOT NULL, source_hash TEXT NOT NULL,
- observed_at_ms INTEGER NOT NULL, last_observed_at_ms INTEGER NOT NULL,
- UNIQUE(record_id,origin,acquired_thread_id,source_hash));
- CREATE INDEX acquisitions_thread ON source_acquisitions(acquired_thread_id,record_id);
- CREATE TRIGGER immutable_versions_update BEFORE UPDATE ON source_versions BEGIN SELECT RAISE(ABORT,'source versions are immutable'); END;
- CREATE TRIGGER immutable_versions_delete BEFORE DELETE ON source_versions BEGIN SELECT RAISE(ABORT,'source versions are immutable'); END;
- CREATE TRIGGER immutable_links_update BEFORE UPDATE ON source_links BEGIN SELECT RAISE(ABORT,'source relationships are immutable'); END;
- CREATE TRIGGER immutable_links_delete BEFORE DELETE ON source_links BEGIN SELECT RAISE(ABORT,'source relationships are immutable'); END;
- CREATE TABLE sync_state(account_id TEXT NOT NULL, scope TEXT NOT NULL, scope_id TEXT NOT NULL, state TEXT NOT NULL CHECK(json_valid(state)), PRIMARY KEY(account_id,scope,scope_id));`)
-	if err != nil {
-		return err
-	}
-	for table, fields := range indexedFields {
-		query := `CREATE VIEW ` + table + ` AS SELECT r.*,v.content_hash,p.acquired_thread_id,p.origin,p.source_hash`
-		for _, field := range fields {
-			expr := `CASE WHEN json_type(v.residual,'$.` + field + `') IN ('integer','real') THEN v.residual -> '$.` + field + `' ELSE CAST(json_extract(v.residual,'$.` + field + `') AS TEXT) END`
-			query += `,` + expr + ` AS ` + field
-			// Expression indexes keep useful source fields queryable without another copy.
-			if _, err = tx.Exec(`CREATE INDEX versions_` + table + `_` + field + ` ON source_versions(account_id,` + strings.ReplaceAll(expr, "v.residual", "residual") + `) WHERE kind='` + table + `'`); err != nil {
-				return fmt.Errorf("source index %s.%s: %w", table, field, err)
-			}
-		}
-		content := childResidual("v.version_id", "content")
-		if table == "messages" {
-			query += `,json_extract(` + content + `,'$.__typename') AS content_type,json_type(` + content + `,'$.is_reaction_action_log') AS reaction_type`
-			query += `,json_extract(` + content + `,'$.text_body') AS content_text,json_extract(` + content + `,'$.xma_text_body') AS xma_text`
-			query += `,json_extract(` + childResidual(`(SELECT l.child_id FROM source_links l WHERE l.parent_id=v.version_id AND l.field='content' ORDER BY l.slot LIMIT 1)`, "xma") + `,'$.caption_body_text') AS caption_text`
-		}
-		if table == "deltas" {
-			message := childResidual("v.version_id", "message")
-			query += `,json_extract(` + message + `,'$.id') AS nested_message_id,json_extract(` + message + `,'$.message_id') AS nested_message_source_id,json_extract(` + childResidual("v.version_id", "reaction") + `,'$.log_message_id') AS reaction_log_message_id`
-		}
-		query += ` FROM source_records r JOIN source_versions v ON v.version_id=r.version_id AND v.account_id=r.account_id JOIN source_acquisitions p ON p.acquisition_id=(SELECT acquisition_id FROM source_acquisitions WHERE record_id=r.record_id ORDER BY last_observed_at_ms DESC,acquisition_id DESC LIMIT 1) WHERE r.kind='` + table + `'`
-		if _, err = tx.Exec(query); err != nil {
-			return err
-		}
-	}
-	_, err = tx.Exec(fmt.Sprintf("PRAGMA user_version=%d", schemaVersion))
-	return err
+func childResidual(parent, field string) string {
+	return `(WITH RECURSIVE children(id,field) AS (SELECT child_id,field FROM source_relations WHERE parent_id=` + parent + ` AND child_id IS NOT NULL UNION ALL SELECT r.child_id,c.field||'.'||r.field FROM children c JOIN source_relations r ON r.parent_id=c.id WHERE r.child_id IS NOT NULL) SELECT v.residual FROM children c JOIN source_versions v ON v.version_id=c.id WHERE c.field='` + field + `' LIMIT 1)`
 }

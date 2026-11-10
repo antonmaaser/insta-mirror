@@ -108,15 +108,8 @@ func (e *Engine) archive(ctx context.Context, raw []byte, spec pageSpec) error {
 	}
 	err := e.archiveTransaction(ctx, func(tx *sql.Tx) error {
 		if spec.Messages {
-			if store.Identity("threads", container) != "" && store.String(container, "thread_fbid") != "" {
-				if err := e.thread(ctx, tx, container, spec.Path, now); err != nil {
-					return err
-				}
-			}
-			for _, edge := range page.Edges {
-				if err := e.message(ctx, tx, edge.Node, spec.ID, spec.Path, now); err != nil {
-					return err
-				}
+			if err := store.Put(ctx, tx, store.Record{Table: "threads", Account: e.Account, Raw: container, Thread: spec.ID, Origin: spec.Path, Context: spec.Scope + ":" + spec.ID + ":" + spec.Previous, Observed: now}); err != nil {
+				return err
 			}
 		} else {
 			for _, edge := range page.Edges {
@@ -176,41 +169,8 @@ func (e *Engine) archive(ctx context.Context, raw []byte, spec pageSpec) error {
 	}
 	return nil
 }
-func (e *Engine) user(ctx context.Context, tx *sql.Tx, raw json.RawMessage, origin string, now int64) error {
-	if !object(raw) || store.Identity("users", raw) == "" {
-		return nil
-	}
-	// Embedded partial profiles remain observations, never replacements for fuller objects.
-	return store.Put(ctx, tx, store.Record{Table: "users", Account: e.Account, Raw: raw, Origin: origin, Observed: now})
-}
 func (e *Engine) thread(ctx context.Context, tx *sql.Tx, raw json.RawMessage, origin string, now int64) error {
-	if err := store.Put(ctx, tx, store.Record{Table: "threads", Account: e.Account, Raw: raw, Origin: origin, Observed: now}); err != nil {
-		return err
-	}
-	if store.String(raw, "thread_fbid") == "" {
-		if err := store.SaveState(ctx, tx, e.Account, "thread", "unresolved:"+store.Identity("threads", raw), store.State{Error: "source thread lacks the thread_fbid needed for history acquisition"}); err != nil {
-			return err
-		}
-	}
-	var users []json.RawMessage
-	if err := json.Unmarshal(field(raw, "users"), &users); err == nil {
-		for _, u := range users {
-			if err = e.user(ctx, tx, u, origin, now); err != nil {
-				return err
-			}
-		}
-	}
-	return e.user(ctx, tx, field(raw, "viewer"), origin, now)
-}
-func (e *Engine) message(ctx context.Context, tx *sql.Tx, raw json.RawMessage, thread, origin string, now int64) error {
-	if !object(raw) {
-		return nil
-	}
-	// Inbox snippets are never passed here; only complete history or delta message nodes.
-	if err := store.Put(ctx, tx, store.Record{Table: "messages", Account: e.Account, Thread: thread, Raw: raw, Origin: origin, Observed: now}); err != nil {
-		return err
-	}
-	return e.user(ctx, tx, field(raw, "sender", "user_dict"), origin, now)
+	return store.Put(ctx, tx, store.Record{Table: "threads", Account: e.Account, Raw: raw, Origin: origin, Observed: now})
 }
 func pause(ctx context.Context, d time.Duration) error {
 	t := time.NewTimer(d)
@@ -305,7 +265,7 @@ func (e *Engine) History(ctx context.Context) error {
 			}
 		}
 	}
-	rows, err := e.DB.DB.QueryContext(ctx, `SELECT DISTINCT thread_fbid FROM threads WHERE account_id=? AND thread_fbid IS NOT NULL AND thread_fbid!=''`, e.Account)
+	rows, err := e.DB.DB.QueryContext(ctx, `SELECT DISTINCT thread_fbid FROM threads_sources WHERE account_id=? AND thread_fbid IS NOT NULL AND thread_fbid!=''`, e.Account)
 	if err != nil {
 		return err
 	}
@@ -338,7 +298,7 @@ func (e *Engine) History(ctx context.Context) error {
 	}
 	state := store.State{Complete: failures == 0 && len(folderErrors) == 0, LastSuccess: previous.LastSuccess, Gaps: folderErrors}
 	var unresolved int
-	if err = e.DB.DB.QueryRowContext(ctx, `SELECT count(DISTINCT source_identity) FROM threads WHERE account_id=? AND (thread_fbid IS NULL OR thread_fbid='')`, e.Account).Scan(&unresolved); err != nil {
+	if err = e.DB.DB.QueryRowContext(ctx, `SELECT count(DISTINCT source_identity) FROM threads_sources WHERE account_id=? AND (thread_fbid IS NULL OR thread_fbid='')`, e.Account).Scan(&unresolved); err != nil {
 		return err
 	}
 	if unresolved > 0 {
@@ -373,7 +333,7 @@ func (e *Engine) historyThread(ctx context.Context, id string) error {
 		return err
 	}
 	var paginationID string
-	if err := e.DB.DB.QueryRowContext(ctx, `SELECT id FROM threads WHERE account_id=? AND thread_fbid=? AND id IS NOT NULL AND id!='' ORDER BY last_observed_at_ms DESC,record_id DESC LIMIT 1`, e.Account, id).Scan(&paginationID); err != nil {
+	if err := e.DB.DB.QueryRowContext(ctx, `SELECT id FROM threads_sources WHERE account_id=? AND thread_fbid=? AND id IS NOT NULL AND id!='' ORDER BY last_observed_at_ms DESC,record_id DESC LIMIT 1`, e.Account, id).Scan(&paginationID); err != nil {
 		return fmt.Errorf("missing source pagination identity: %w", err)
 	}
 	seen := map[string]bool{}

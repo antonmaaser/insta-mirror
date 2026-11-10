@@ -22,7 +22,7 @@ type Media struct {
 }
 
 func (s *Store) InitializeMedia() error {
-	_, err := s.DB.Exec(`CREATE TABLE IF NOT EXISTS media_cache(account_id TEXT NOT NULL,message_record_id INTEGER NOT NULL,attachment_reference TEXT NOT NULL,url_hash TEXT NOT NULL,status TEXT NOT NULL,content_hash TEXT NOT NULL DEFAULT '',mime_type TEXT NOT NULL DEFAULT '',byte_size INTEGER NOT NULL DEFAULT 0,attempts INTEGER NOT NULL DEFAULT 0,last_attempt_ms INTEGER NOT NULL DEFAULT 0,error TEXT NOT NULL DEFAULT '',PRIMARY KEY(account_id,message_record_id,attachment_reference),FOREIGN KEY(account_id,message_record_id) REFERENCES source_records(account_id,record_id));CREATE INDEX IF NOT EXISTS media_content ON media_cache(account_id,content_hash);CREATE INDEX IF NOT EXISTS media_attachment ON media_cache(account_id,attachment_reference,url_hash)`)
+	_, err := s.DB.Exec(`CREATE TABLE IF NOT EXISTS media_cache(account_id TEXT NOT NULL,message_record_id INTEGER NOT NULL,attachment_reference TEXT NOT NULL,url_hash TEXT NOT NULL,status TEXT NOT NULL,content_hash TEXT NOT NULL DEFAULT '',mime_type TEXT NOT NULL DEFAULT '',byte_size INTEGER NOT NULL DEFAULT 0,attempts INTEGER NOT NULL DEFAULT 0,last_attempt_ms INTEGER NOT NULL DEFAULT 0,error TEXT NOT NULL DEFAULT '',PRIMARY KEY(account_id,message_record_id,attachment_reference),FOREIGN KEY(account_id,message_record_id) REFERENCES source_versions(account_id,version_id));CREATE INDEX IF NOT EXISTS media_content ON media_cache(account_id,content_hash);CREATE INDEX IF NOT EXISTS media_attachment ON media_cache(account_id,attachment_reference,url_hash)`)
 	return err
 }
 func (s *Store) SaveMedia(ctx context.Context, m Media) error {
@@ -60,7 +60,7 @@ func (s *Store) MediaHash(ctx context.Context, account, hash string) (Media, err
 	return mediaScan(s.queryRowContext(ctx, `SELECT * FROM media_cache WHERE account_id=? AND content_hash=? AND status='available' LIMIT 1`, account, hash))
 }
 func (s *Store) MessageBatch(ctx context.Context, account string, after int64) ([]Record, error) {
-	rows, err := s.queryContext(ctx, `SELECT record_id,version_id,content_hash FROM messages WHERE account_id=? AND record_id>? ORDER BY record_id LIMIT 100`, account, after)
+	rows, err := s.queryContext(ctx, `SELECT record_id,version_id,content_hash FROM messages_sources WHERE account_id=? AND record_id>? ORDER BY record_id LIMIT 100`, account, after)
 	if err != nil {
 		return nil, err
 	}

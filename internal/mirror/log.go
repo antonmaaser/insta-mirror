@@ -127,34 +127,29 @@ func (e *Engine) archiveTransaction(ctx context.Context, fn func(*sql.Tx) error)
 	}
 	var items []createdItem
 	err := e.DB.Transaction(ctx, func(tx *sql.Tx) error {
-		tables := []string{"threads", "messages", "users", "deltas"}
-		var before [4]int64
-		for i, table := range tables {
-			if err := tx.QueryRowContext(ctx, `SELECT coalesce(max(record_id),0) FROM `+table).Scan(&before[i]); err != nil {
-				return err
-			}
+		var before int64
+		if err := tx.QueryRowContext(ctx, `SELECT coalesce(max(version_id),0) FROM source_versions`).Scan(&before); err != nil {
+			return err
 		}
 		if err := fn(tx); err != nil {
 			return err
 		}
-		for i, table := range tables {
-			rows, err := tx.QueryContext(ctx, `SELECT record_id,account_id,origin FROM `+table+` WHERE record_id>? ORDER BY record_id`, before[i])
-			if err != nil {
+		rows, err := tx.QueryContext(ctx, `SELECT kind,version_id,account_id FROM source_versions WHERE version_id>? AND kind IN ('threads','messages','users','deltas') ORDER BY version_id`, before)
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			var item createdItem
+			if err = rows.Scan(&item.kind, &item.rowID, &item.account); err != nil {
+				rows.Close()
 				return err
 			}
-			for rows.Next() {
-				item := createdItem{kind: table}
-				if err := rows.Scan(&item.rowID, &item.account, &item.origin); err != nil {
-					rows.Close()
-					return err
-				}
-				items = append(items, item)
-			}
-			err = rows.Err()
-			rows.Close()
-			if err != nil {
-				return err
-			}
+			items = append(items, item)
+		}
+		err = rows.Err()
+		rows.Close()
+		if err != nil {
+			return err
 		}
 		return nil
 	})

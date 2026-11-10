@@ -70,7 +70,7 @@ func (s *Store) queryRowContext(ctx context.Context, query string, args ...any) 
 }
 
 func (s *Store) Accounts(ctx context.Context) ([]string, error) {
-	rows, err := s.queryContext(ctx, `SELECT account_id FROM threads UNION SELECT account_id FROM messages UNION SELECT account_id FROM users UNION SELECT account_id FROM deltas UNION SELECT account_id FROM sync_state ORDER BY account_id`)
+	rows, err := s.queryContext(ctx, `SELECT account_id FROM threads_sources UNION SELECT account_id FROM messages_sources UNION SELECT account_id FROM users_sources UNION SELECT account_id FROM deltas_sources UNION SELECT account_id FROM sync_state ORDER BY account_id`)
 	if err != nil {
 		return nil, err
 	}
@@ -103,7 +103,7 @@ func (s *Store) TranscriptMessages(ctx context.Context, account, thread string, 
 			args = append(args, ref)
 		}
 	}
-	rows, err := s.queryContext(ctx, `WITH ranked AS (SELECT *,row_number() OVER(PARTITION BY source_identity ORDER BY last_observed_at_ms DESC,record_id DESC) AS rank FROM messages WHERE account_id=?) SELECT record_id,source_identity,acquired_thread_id,origin,observed_at_ms,last_observed_at_ms,source_hash,version_id,content_hash FROM ranked WHERE rank=1 AND (thread_fbid IN (`+marks+`) OR EXISTS (SELECT 1 FROM source_acquisitions a WHERE a.record_id=ranked.record_id AND a.acquired_thread_id IN (`+marks+`))) ORDER BY (timestamp_ms IS NULL OR timestamp_ms=''),CAST(timestamp_ms AS INTEGER),record_id`, args...)
+	rows, err := s.queryContext(ctx, `WITH ranked AS (SELECT *,row_number() OVER(PARTITION BY source_identity ORDER BY last_observed_at_ms DESC,record_id DESC) AS rank FROM messages_sources WHERE account_id=?) SELECT record_id,source_identity,acquired_thread_id,origin,observed_at_ms,last_observed_at_ms,source_hash,version_id,content_hash FROM ranked WHERE rank=1 AND (thread_fbid IN (`+marks+`) OR EXISTS (SELECT 1 FROM source_evidence ev JOIN source_observations a ON a.observation_id=ev.observation_id WHERE ev.version_id=ranked.record_id AND a.acquired_thread_id IN (`+marks+`))) ORDER BY (timestamp_ms IS NULL OR timestamp_ms=''),CAST(timestamp_ms AS INTEGER),record_id`, args...)
 	if err != nil {
 		return err
 	}

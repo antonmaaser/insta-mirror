@@ -47,38 +47,24 @@ func qualified(table, ref string) (string, string, error) {
 	return "", "", errors.New("unsupported identifier namespace")
 }
 func (s *Store) ThreadReferences(ctx context.Context, account, ref string) ([]string, error) {
-	col, value, err := qualified("threads", ref)
+	entity, err := s.ResolveEntity(ctx, account, "threads", ref)
 	if err != nil {
 		return nil, err
 	}
-	rows, err := s.queryContext(ctx, `SELECT DISTINCT id,thread_fbid FROM threads WHERE account_id=? AND (`+col+`=? OR source_identity=?)`, account, value, ref)
+	rows, err := s.queryContext(ctx, `SELECT DISTINCT value FROM source_ids WHERE account_id=? AND thread_entity_id=? AND namespace='thread.fbid'`, account, entity)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	var out []string
-	seen := map[string]bool{}
 	for rows.Next() {
-		var id, fbid sql.NullString
-		if err = rows.Scan(&id, &fbid); err != nil {
+		var value string
+		if err = rows.Scan(&value); err != nil {
 			return nil, err
 		}
-		if id.String != "" && !seen[id.String] {
-			seen[id.String] = true
-			out = append(out, id.String)
-		}
-		if fbid.String != "" && !seen[fbid.String] {
-			seen[fbid.String] = true
-			out = append(out, fbid.String)
-		}
+		out = append(out, value)
 	}
-	if err = rows.Err(); err != nil {
-		return nil, err
-	}
-	if len(out) == 0 {
-		return nil, errors.New("thread is not archived")
-	}
-	return out, nil
+	return out, rows.Err()
 }
 func (s *Store) Query(ctx context.Context, table string, q Query) (Page, error) {
 	out := Page{Records: []Record{}}
@@ -106,7 +92,7 @@ func (s *Store) Query(ctx context.Context, table string, q Query) (Page, error) 
 			return out, errors.New("invalid cursor for these filters")
 		}
 	} else {
-		if err := s.queryRowContext(ctx, `SELECT coalesce(max(record_id),0) FROM `+table+` WHERE account_id=?`, q.Account).Scan(&pos.Top); err != nil {
+		if err := s.queryRowContext(ctx, `SELECT coalesce(max(record_id),0) FROM `+table+`_sources WHERE account_id=?`, q.Account).Scan(&pos.Top); err != nil {
 			return out, err
 		}
 		pos.Before = pos.Top + 1
@@ -120,13 +106,17 @@ func (s *Store) Query(ctx context.Context, table string, q Query) (Page, error) 
 	outer := `record_id<?`
 	outerArgs := []any{pos.Before}
 	if q.SourceID != "" {
-		col, value, err := qualified(table, q.SourceID)
+		entity, err := s.ResolveEntity(ctx, q.Account, table, q.SourceID)
+		if errors.Is(err, sql.ErrNoRows) {
+			return out, nil
+		}
 		if err != nil {
 			return out, err
 		}
-		outer += ` AND (` + col + `=? OR source_identity=?)`
-		outerArgs = append(outerArgs, value, q.SourceID)
+		outer += ` AND entity_id=?`
+		outerArgs = append(outerArgs, entity)
 	}
+
 	if table == "messages" {
 		if q.ThreadID != "" {
 			refs, err := s.ThreadReferences(ctx, q.Account, q.ThreadID)
@@ -134,7 +124,7 @@ func (s *Store) Query(ctx context.Context, table string, q Query) (Page, error) 
 				return out, err
 			}
 			placeholders := strings.TrimSuffix(strings.Repeat("?,", len(refs)), ",")
-			outer += ` AND (thread_fbid IN (` + placeholders + `) OR EXISTS (SELECT 1 FROM source_acquisitions a WHERE a.record_id=ranked.record_id AND a.acquired_thread_id IN (` + placeholders + `)))`
+			outer += ` AND (thread_fbid IN (` + placeholders + `) OR EXISTS (SELECT 1 FROM source_evidence ev JOIN source_observations a ON a.observation_id=ev.observation_id WHERE ev.version_id=ranked.record_id AND a.acquired_thread_id IN (` + placeholders + `)))`
 			for range 2 {
 				for _, ref := range refs {
 					outerArgs = append(outerArgs, ref)
@@ -160,7 +150,7 @@ func (s *Store) Query(ctx context.Context, table string, q Query) (Page, error) 
 			outer += ` AND (instr(lower(coalesce(text_body,'')),lower(?))>0 OR instr(lower(coalesce(content_text,'')),lower(?))>0 OR instr(lower(coalesce(xma_text,'')),lower(?))>0 OR instr(lower(coalesce(caption_text,'')),lower(?))>0 OR instr(lower(coalesce(igd_snippet,'')),lower(?))>0)`
 			// Edits remain source deltas; match their text without manufacturing a
 			// replacement message object. Projection returns their source references.
-			outer = strings.TrimSuffix(outer, ")") + ` OR EXISTS (SELECT 1 FROM deltas d WHERE d.account_id=ranked.account_id AND (d.message_id=ranked.message_id OR d.message_id=ranked.id OR d.nested_message_id=ranked.id OR d.nested_message_source_id=ranked.message_id) AND (d.thread_fbid=ranked.thread_fbid OR d.thread_fbid=ranked.acquired_thread_id) AND instr(lower(coalesce(d.text_body,'')),lower(?))>0))`
+			outer = strings.TrimSuffix(outer, ")") + ` OR EXISTS (SELECT 1 FROM deltas_sources d WHERE d.account_id=ranked.account_id AND (d.message_id=ranked.message_id OR d.message_id=ranked.id OR d.nested_message_id=ranked.id OR d.nested_message_source_id=ranked.message_id) AND (d.thread_fbid=ranked.thread_fbid OR d.thread_fbid=ranked.acquired_thread_id) AND instr(lower(coalesce(d.text_body,'')),lower(?))>0))`
 			for range 6 {
 				outerArgs = append(outerArgs, q.Text)
 			}
@@ -174,7 +164,7 @@ func (s *Store) Query(ctx context.Context, table string, q Query) (Page, error) 
 	if q.Text != "" {
 		rankFilter = "rank>=1"
 	}
-	sqlText := `WITH ranked AS (SELECT *,row_number() OVER(PARTITION BY source_identity ORDER BY ` + rankOrder + `) AS rank FROM ` + table + ` WHERE ` + where + `) SELECT record_id,account_id,source_identity,acquired_thread_id,origin,observed_at_ms,last_observed_at_ms,source_hash,version_id,content_hash FROM ranked WHERE ` + rankFilter + ` AND ` + outer + ` ORDER BY record_id DESC LIMIT ?`
+	sqlText := `WITH ranked AS (SELECT *,row_number() OVER(PARTITION BY source_identity ORDER BY ` + rankOrder + `) AS rank FROM ` + table + `_sources WHERE ` + where + `) SELECT record_id,account_id,source_identity,acquired_thread_id,origin,observed_at_ms,last_observed_at_ms,source_hash,version_id,content_hash FROM ranked WHERE ` + rankFilter + ` AND ` + outer + ` ORDER BY record_id DESC LIMIT ?`
 	args = append(args, outerArgs...)
 	args = append(args, q.Limit+1)
 	rows, err := s.queryContext(ctx, sqlText, args...)
@@ -236,7 +226,7 @@ func (s *Store) Deltas(ctx context.Context, account string, threads []string, me
 		// Thread deletion changes message availability as well.
 		where += ` AND ((` + strings.Join(cond, " OR ") + `) OR __typename='SlideUQPPDeleteThread')`
 	}
-	rows, err := s.queryContext(ctx, `SELECT record_id,source_identity,origin,observed_at_ms,last_observed_at_ms,source_hash,version_id,content_hash FROM deltas WHERE `+where+` ORDER BY CAST(uq_seq_id AS INTEGER),record_id LIMIT 201`, args...)
+	rows, err := s.queryContext(ctx, `SELECT record_id,source_identity,origin,observed_at_ms,last_observed_at_ms,source_hash,version_id,content_hash FROM deltas_sources WHERE `+where+` ORDER BY CAST(uq_seq_id AS INTEGER),record_id LIMIT 201`, args...)
 	if err != nil {
 		return nil, false, err
 	}
@@ -273,7 +263,7 @@ func (s *Store) Record(ctx context.Context, account, table string, id int64) (Re
 	if table != "threads" && table != "messages" && table != "users" && table != "deltas" {
 		return r, errors.New("invalid source kind")
 	}
-	err := s.queryRowContext(ctx, `SELECT record_id,source_identity,acquired_thread_id,origin,observed_at_ms,last_observed_at_ms,source_hash,version_id,content_hash FROM `+table+` WHERE account_id=? AND record_id=?`, account, id).Scan(&r.RowID, &r.Identity, &r.Thread, &r.Origin, &r.Observed, &r.LastObserved, &r.Hash, &r.Version, &r.ContentHash)
+	err := s.queryRowContext(ctx, `SELECT record_id,source_identity,acquired_thread_id,origin,observed_at_ms,last_observed_at_ms,source_hash,version_id,content_hash FROM `+table+`_sources WHERE account_id=? AND record_id=?`, account, id).Scan(&r.RowID, &r.Identity, &r.Thread, &r.Origin, &r.Observed, &r.LastObserved, &r.Hash, &r.Version, &r.ContentHash)
 	if err != nil {
 		return r, err
 	}
