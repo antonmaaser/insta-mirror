@@ -3,7 +3,6 @@ package mirror
 import (
 	"bufio"
 	"context"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -15,12 +14,11 @@ import (
 
 	"go.mau.fi/mautrix-meta/internal/projection"
 	"go.mau.fi/mautrix-meta/internal/store"
-	"go.mau.fi/mautrix-meta/pkg/instameow/slidetypes"
 )
 
 func runCommand(ctx context.Context, args []string, defaultDir string) error {
 	if len(args) > 0 && (args[0] == "help" || args[0] == "--help") {
-		fmt.Fprintln(os.Stdout, "igdm-mirror cmd [--data-dir DIR | --db FILE] [--account ID] [--export-dir DIR]\n  Interactive: ↑/↓ select, → inspect, ← chats, e export, q/Esc quit\n  Direct: cmd chats [--limit 30] [--cursor CURSOR]\n          cmd export --chat id:SOURCE_ID --output FILE")
+		fmt.Fprintln(os.Stdout, "igdm-mirror cmd [--data-dir DIR | --db FILE] [--account ID] [--export-dir DIR]\n  Interactive: ↑/↓ select, → inspect, ← chats, e export, q/Esc quit\n  Direct: cmd chats [--limit 30] [--cursor CURSOR]\n          cmd export --chat LOCAL_ID --output FILE")
 		return nil
 	}
 	action := "ui"
@@ -44,7 +42,7 @@ func runCommand(ctx context.Context, args []string, defaultDir string) error {
 		fs.IntVar(&limit, "limit", 30, "maximum chats, 1 through 100")
 		fs.StringVar(&cursor, "cursor", "", "next cursor from a previous listing")
 	} else {
-		fs.StringVar(&chat, "chat", "", "namespaced source reference from cmd chats")
+		fs.StringVar(&chat, "chat", "", "local thread ID from cmd chats")
 		fs.StringVar(&output, "output", "", "new transcript file; existing files are never replaced")
 	}
 	if err := fs.Parse(args); err != nil {
@@ -135,31 +133,24 @@ func inspectChats(ctx context.Context, db *store.Store, account, cursor string, 
 	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
 	fmt.Fprintf(w, "Account: %s\nREFERENCE\tTITLE\tPARTICIPANTS\tLAST ACTIVITY (UTC)\n", account)
 	for _, record := range page.Records {
-		var thread slidetypes.ThreadInfo
-		_ = json.Unmarshal(record.Raw, &thread)
-		title := store.String(record.Raw, "thread_title")
+		thread := record.Thread
+		title := ""
+		if thread.Title != nil {
+			title = *thread.Title
+		}
 		var participants []string
-		for i, user := range thread.Users {
-			if user == nil {
-				continue
-			}
-			name := user.FullName
-			if name == "" {
-				name = user.Username
-			}
-			participants = append(participants, name)
-			if len(participants) == 8 {
-				if i+1 < len(thread.Users) {
-					participants = append(participants, "…")
-				}
+		for i, member := range thread.Members {
+			if i == 8 {
+				participants = append(participants, "…")
 				break
 			}
+			participants = append(participants, member.Name)
 		}
 		stamp := "unknown"
-		if !thread.LastActivityTimestampMS.IsZero() {
-			stamp = thread.LastActivityTimestampMS.UTC().Format(time.RFC3339)
+		if thread.ActivityAt != 0 {
+			stamp = time.UnixMilli(thread.ActivityAt).UTC().Format(time.RFC3339)
 		}
-		fmt.Fprintf(w, "%q\t%q\t%q\t%s\n", record.Identity, title, strings.Join(participants, ", "), stamp)
+		fmt.Fprintf(w, "%d\t%q\t%q\t%s\n", record.ID, title, strings.Join(participants, ", "), stamp)
 	}
 	if err = w.Flush(); err != nil {
 		return err
@@ -231,7 +222,7 @@ func selectedChat(ctx context.Context, db *store.Store, account, identity string
 		return store.Record{}, err
 	}
 	if len(page.Records) != 1 {
-		return store.Record{}, errors.New("chat reference is unavailable or ambiguous; use a source reference from cmd chats")
+		return store.Record{}, errors.New("chat reference is unavailable or ambiguous; use a local thread ID from cmd chats")
 	}
 	return page.Records[0], nil
 }

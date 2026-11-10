@@ -43,7 +43,7 @@ func OpenReadOnly(ctx context.Context, path string) (*Store, error) {
 	return &Store{DB: db}, nil
 }
 
-// ReadSnapshot keeps all source, delta, media and coverage reads on the same
+// ReadSnapshot keeps entity, media and coverage reads on the same
 // deferred read transaction. WAL writers can continue committing independently.
 func (s *Store) ReadSnapshot(ctx context.Context, fn func(*Store) error) error {
 	if s.readTx != nil {
@@ -72,7 +72,7 @@ func (s *Store) queryRowContext(ctx context.Context, query string, args ...any) 
 }
 
 func (s *Store) Accounts(ctx context.Context) ([]string, error) {
-	rows, err := s.queryContext(ctx, `SELECT account_id FROM threads_sources UNION SELECT account_id FROM messages_sources UNION SELECT account_id FROM users_sources UNION SELECT account_id FROM deltas_sources UNION SELECT account_id FROM sync_state ORDER BY account_id`)
+	rows, err := s.queryContext(ctx, `SELECT account_id FROM threads UNION SELECT account_id FROM messages UNION SELECT account_id FROM users UNION SELECT account_id FROM sync_state ORDER BY account_id`)
 	if err != nil {
 		return nil, err
 	}
@@ -86,38 +86,4 @@ func (s *Store) Accounts(ctx context.Context) ([]string, error) {
 		accounts = append(accounts, id)
 	}
 	return accounts, rows.Err()
-}
-
-// TranscriptMessages streams the latest stored snapshot per source identity in
-// source timestamp order. A read snapshot is required for nested projections.
-func (s *Store) TranscriptMessages(ctx context.Context, account, thread string, visit func(Record) error) error {
-	if s.readTx == nil {
-		return fmt.Errorf("transcript requires a read snapshot")
-	}
-	entity, err := s.ResolveEntity(ctx, account, "threads", thread)
-	if err != nil {
-		return err
-	}
-	var top int64
-	if err = s.queryRowContext(ctx, `SELECT coalesce(max(observation_id),0) FROM source_observations WHERE account_id=?`, account).Scan(&top); err != nil {
-		return err
-	}
-	rows, err := s.queryContext(ctx, sourceCTE("messages")+`, ranked AS (SELECT *,row_number() OVER(PARTITION BY entity_id ORDER BY `+rankOrder("messages")+`) AS rank FROM candidates) SELECT `+recordColumns+` FROM ranked WHERE rank=1 AND EXISTS(SELECT 1 FROM message_threads mt WHERE mt.account_id=ranked.account_id AND mt.message_version_id=ranked.version_id AND mt.thread_entity_id=?) ORDER BY (timestamp_ms IS NULL OR timestamp_ms=''),CAST(timestamp_ms AS INTEGER),entity_id`, account, top, entity)
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-	for rows.Next() {
-		r := Record{Table: "messages", watermark: top}
-		if err = scanRecord(rows, &r); err != nil {
-			return err
-		}
-		if err = s.hydrate(ctx, &r); err != nil {
-			return err
-		}
-		if err = visit(r); err != nil {
-			return err
-		}
-	}
-	return rows.Err()
 }

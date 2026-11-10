@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -18,7 +17,6 @@ import (
 
 	"go.mau.fi/mautrix-meta/internal/projection"
 	"go.mau.fi/mautrix-meta/internal/store"
-	"go.mau.fi/mautrix-meta/pkg/instameow/slidetypes"
 	"golang.org/x/sys/unix"
 	"golang.org/x/term"
 	"golang.org/x/text/width"
@@ -155,17 +153,9 @@ func chatName(row store.ChatRow) string {
 	if strings.TrimSpace(row.Title) != "" {
 		return row.Title
 	}
-	var users []*slidetypes.User
-	_ = json.Unmarshal(row.Users, &users)
 	var names []string
-	for _, user := range users {
-		if user == nil {
-			continue
-		}
-		name := user.FullName
-		if name == "" {
-			name = user.Username
-		}
+	for _, member := range row.Members {
+		name := member.Name
 		if name != "" {
 			names = append(names, name)
 		}
@@ -339,7 +329,7 @@ func runTerminal(ctx context.Context, db *store.Store, dbPath, account, exportDi
 		})
 		for i := range result.rows {
 			result.rows[i].Title = chatName(result.rows[i])
-			result.rows[i].Users = nil
+			result.rows[i].Members = nil
 		}
 		return result
 	}
@@ -422,8 +412,7 @@ func runTerminal(ctx context.Context, db *store.Store, dbPath, account, exportDi
 						if index == focus {
 							prefix = "> "
 						}
-						suffix := fmt.Sprintf(" (%d)", rows[index].Messages)
-						text = terminalLine(prefix+chatName(rows[index]), max(0, columns-1-len(suffix))) + suffix
+						text = terminalLine(prefix+chatName(rows[index]), max(0, columns-1))
 					} else if len(rows) == 0 && i == 0 && !busy {
 						text = "No mirrored chats"
 					}

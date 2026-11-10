@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
+	"strings"
 
 	"go.mau.fi/mautrix-meta/internal/media"
 	"go.mau.fi/mautrix-meta/internal/store"
@@ -55,7 +56,10 @@ func (o sourceObject) fields(spec map[string]string) (map[string]any, error) {
 			continue
 		}
 		if string(raw) == "null" {
-			values[column] = nil
+			switch column {
+			case "title", "image_url", "avatar_url", "nickname":
+				values[column] = ""
+			}
 			continue
 		}
 		var v any
@@ -132,13 +136,10 @@ func (b *ingestion) resolve(kind string, aliases []store.Alias, primary string, 
 	return id, created, bound, err
 }
 
-func (b *ingestion) decision(kind string, id int64, created, bound, fill bool, fields []string) {
+func (b *ingestion) decision(kind string, id int64, created, bound bool, fields []string) {
 	action, reason := "unchanged", "values match"
 	if bound {
 		fields = append(fields, "source_ids")
-	}
-	if fill && len(fields) == 0 {
-		action, reason = "ignored_stale", "older or partial input supplied no missing values"
 	}
 	if len(fields) > 0 {
 		action, reason = "updated", ""
@@ -147,6 +148,12 @@ func (b *ingestion) decision(kind string, id int64, created, bound, fill bool, f
 		action, reason = "created", "canonical source ID"
 	}
 	b.decisions = append(b.decisions, store.Decision{Kind: kind, ID: id, Action: action, Reason: reason, Fields: fields})
+}
+
+func (b *ingestion) ignored(kind string, id int64, fields []string) {
+	if len(fields) > 0 {
+		b.decisions = append(b.decisions, store.Decision{Kind: kind, ID: id, Action: "ignored_stale", Reason: "kept newer or fuller information", Fields: fields})
+	}
 }
 
 func (b *ingestion) unsupported(kind string, id int64, o sourceObject, spec map[string]string, consumed ...string) {
@@ -167,13 +174,15 @@ func (b *ingestion) unsupported(kind string, id int64, o sourceObject, spec map[
 }
 
 func (b *ingestion) patch(kind string, id int64, values map[string]any, fill bool) ([]string, error) {
-	return store.Patch(b.ctx, b.tx, kind, "account_id=? AND id=?", []any{b.account, id}, values, fill, b.event)
+	changed, ignored, err := store.Patch(b.ctx, b.tx, kind, "account_id=? AND id=?", []any{b.account, id}, values, fill)
+	b.ignored(kind, id, ignored)
+	return changed, err
 }
 
 func (b *ingestion) userRef(ns, id string) (int64, error) {
 	owner, created, bound, err := b.resolve("users", addAlias(nil, ns, "", id), "user.igid", 0)
 	if err == nil {
-		b.decision("users", owner, created, bound, false, nil)
+		b.decision("users", owner, created, bound, nil)
 	}
 	return owner, err
 }
@@ -230,7 +239,7 @@ func (b *ingestion) user(raw json.RawMessage, igid, fbid, name string, fill bool
 		fields = append(fields, more...)
 		err = e
 	}
-	b.decision("users", id, created, bound, fill, fields)
+	b.decision("users", id, created, bound, fields)
 	b.unsupported("users", id, o, profileFields, "id", "pk", "igid", "interop_messaging_user_fbid", "fbid_v2", "friendship_status", "__typename")
 	return id, err
 }
@@ -274,19 +283,20 @@ func (b *ingestion) thread(raw json.RawMessage, expected int64, remote string, c
 		return 0, err
 	}
 	if deleted.Bool {
-		b.decision("threads", id, created, bound, true, nil)
+		b.ignored("threads", id, []string{"deleted"})
+		b.decision("threads", id, created, bound, nil)
 		return id, nil
 	}
 	fields, err := b.patch("threads", id, values, b.fill)
 	if err != nil {
 		return 0, err
 	}
-	b.decision("threads", id, created, bound, b.fill, fields)
+	b.decision("threads", id, created, bound, fields)
 	b.unsupported("threads", id, o, threadFields, "id", "thread_fbid", "thread_id", "thread_key", "folder", "users", "usersWithoutViewer", "viewer", "viewer_id", "nicknames", "slide_read_receipts", "admin_user_ids", "slide_messages", "pinned_messages", "__typename")
 	if err = b.members(id, o, complete && !b.fill); err != nil {
 		return 0, err
 	}
-	if !b.fill && len(o["pinned_messages"]) > 0 && string(o["pinned_messages"]) != "null" {
+	if complete && !b.fill && len(o["pinned_messages"]) > 0 && string(o["pinned_messages"]) != "null" {
 		var items []json.RawMessage
 		if json.Unmarshal(o["pinned_messages"], &items) != nil {
 			return 0, errors.New("invalid pinned messages")
@@ -334,7 +344,7 @@ func (b *ingestion) thread(raw json.RawMessage, expected int64, remote string, c
 			if e != nil {
 				return 0, e
 			}
-			b.decision("messages", msg, false, false, false, changed)
+			b.decision("messages", msg, false, false, changed)
 		}
 	}
 	return id, nil
@@ -349,8 +359,9 @@ func (b *ingestion) member(thread, user int64, values map[string]any, fill bool)
 	if err != nil {
 		return err
 	}
-	fields, err := store.Patch(b.ctx, b.tx, "thread_members", "thread_id=? AND user_id=?", []any{thread, user}, values, fill, 0)
-	b.decision("thread_members", thread, n > 0, false, fill, fields)
+	fields, ignored, err := store.Patch(b.ctx, b.tx, "thread_members", "thread_id=? AND user_id=?", []any{thread, user}, values, fill)
+	b.ignored("thread_members", thread, ignored)
+	b.decision("thread_members", thread, n > 0, false, fields)
 	return err
 }
 
@@ -510,7 +521,7 @@ func (b *ingestion) receipt(thread int64, raw json.RawMessage) error {
 			return err
 		}
 		if current.Valid && current.Int64 > at {
-			b.decision("thread_members", thread, false, false, true, nil)
+			b.decision("thread_members", thread, false, false, nil)
 			return nil
 		}
 	}
@@ -529,7 +540,7 @@ func (b *ingestion) messageRef(remote string, thread int64) (int64, error) {
 		return 0, err
 	}
 	fields, err := b.messageThread(id, thread)
-	b.decision("messages", id, created, bound, false, fields)
+	b.decision("messages", id, created, bound, fields)
 	return id, err
 }
 
@@ -564,7 +575,7 @@ func (b *ingestion) message(raw json.RawMessage, thread int64, quote bool) (int6
 			return 0, err
 		}
 		thread = resolved
-		b.decision("threads", thread, created, bound, false, nil)
+		b.decision("threads", thread, created, bound, nil)
 	}
 	fields, err := b.messageThread(id, thread)
 	if err != nil {
@@ -577,7 +588,7 @@ func (b *ingestion) message(raw json.RawMessage, thread int64, quote bool) (int6
 		return 0, err
 	}
 	if deleted != 0 {
-		b.decision("messages", id, created, bound, true, fields)
+		b.decision("messages", id, created, bound, fields)
 		return id, nil
 	}
 	values, err := o.fields(messageFields)
@@ -634,24 +645,24 @@ func (b *ingestion) message(raw json.RawMessage, thread int64, quote bool) (int6
 	}
 	if content := o["content"]; len(content) > 0 {
 		var msg slidetypes.Message
-		if json.Unmarshal(raw, &msg) != nil {
+		if string(content) != "null" && json.Unmarshal(content, &msg.Content) != nil {
 			return 0, errors.New("invalid message content")
 		}
-		values["attachments"] = store.JSONValue(media.DescribeAttachments(msg))
-		if node, e := decodeObject(content); e == nil {
-			if _, ok := values["kind"]; !ok && node.id("__typename") != "" {
-				values["kind"] = node.id("__typename")
-			}
-			if _, ok := values["body"]; !ok {
-				for _, k := range []string{"text_body", "xma_text_body"} {
-					if text := node.id(k); text != "" {
-						values["body"] = text
-						break
-					}
-				}
+		if kind, ok := values["kind"].(string); ok {
+			msg.ContentType = kind
+		}
+		expiring := o.id("expiration_timestamp_ms") != "" || o.id("view_expiration_timestamp_ms") != ""
+		values["attachments"] = store.JSONValue(media.DescribeAttachments(msg, expiring))
+		if values["kind"] == nil && msg.Content.TypeName != "" {
+			values["kind"] = msg.Content.TypeName
+		}
+		if values["body"] == nil {
+			if text := displayBody(msg); text != "" {
+				values["body"] = text
 			}
 		}
 	}
+
 	var sourceEdit int64
 	if history := o["slide_edit_history"]; len(history) > 0 && string(history) != "null" {
 		var entries []slidetypes.MessageEditHistoryEntry
@@ -675,9 +686,29 @@ func (b *ingestion) message(raw json.RawMessage, thread int64, quote bool) (int6
 		}
 	}
 	if edited.Valid && (fill || sourceEdit < edited.Int64) {
+		var ignored []string
 		for _, key := range []string{"body", "snippet", "edits", "edited_at"} {
+			if _, present := values[key]; present {
+				ignored = append(ignored, key)
+			}
 			delete(values, key)
 		}
+		b.ignored("messages", id, ignored)
+	}
+	if fill && !quote && placeholder != 0 {
+		// A full acquisition can replace text previously acquired as a quote.
+		full := map[string]any{}
+		for _, key := range []string{"body", "snippet", "kind", "sent_at", "attachments"} {
+			if v, ok := values[key]; ok && v != nil {
+				full[key] = v
+				delete(values, key)
+			}
+		}
+		more, err := b.patch("messages", id, full, false)
+		if err != nil {
+			return 0, err
+		}
+		fields = append(fields, more...)
 	}
 	more, err := b.patch("messages", id, values, fill)
 	if err != nil {
@@ -691,7 +722,17 @@ func (b *ingestion) message(raw json.RawMessage, thread int64, quote bool) (int6
 		}
 		fields = append(fields, more...)
 	}
-	b.decision("messages", id, created, bound, fill, fields)
+	for _, key := range fields {
+		if key == "attachments" {
+			if _, err := b.tx.ExecContext(b.ctx, `DELETE FROM media_cache WHERE account_id=? AND message_id=? AND NOT EXISTS(
+ SELECT 1 FROM json_each((SELECT attachments FROM messages WHERE id=?)) a
+ WHERE a.value->>'key'=media_cache.attachment AND coalesce(a.value->>'restricted',0)=(media_cache.status='restricted'))`, b.account, id, id); err != nil {
+				return 0, err
+			}
+			break
+		}
+	}
+	b.decision("messages", id, created, bound, fields)
 	b.unsupported("messages", id, o, messageFields, "id", "message_id", "thread_fbid", "sender_fbid", "sender", "replied_to_message_id", "replied_to_message", "content", "slide_edit_history", "reactions", "mentions", "offline_threading_id", "__typename")
 	if !quote {
 		if err = b.messageRelations(id, thread, o, fill); err != nil {
@@ -699,6 +740,36 @@ func (b *ingestion) message(raw json.RawMessage, thread int64, quote bool) (int6
 		}
 	}
 	return id, nil
+}
+
+func displayBody(msg slidetypes.Message) string {
+	switch content := msg.Content.Content.(type) {
+	case *slidetypes.MessageContentText:
+		return content.TextBody
+	case *slidetypes.MessageContentAdminText:
+		var parts []string
+		for _, fragment := range content.TextFragments {
+			parts = append(parts, fragment.Plaintext)
+			if fragment.LinkFragment != nil {
+				parts = append(parts, " "+fragment.LinkFragment.URI)
+			}
+		}
+		return strings.Join(parts, "")
+	case *slidetypes.MessageContentXMA:
+		parts := []string{}
+		if content.XMATextBody != "" {
+			parts = append(parts, content.XMATextBody)
+		}
+		if content.XMA != nil {
+			for _, text := range []string{content.XMA.TitleText, content.XMA.CaptionBodyText} {
+				if text != "" {
+					parts = append(parts, text)
+				}
+			}
+		}
+		return strings.Join(parts, "\n")
+	}
+	return ""
 }
 
 func (b *ingestion) messageRelations(id, thread int64, o sourceObject, fill bool) error {
@@ -712,7 +783,7 @@ func (b *ingestion) messageRelations(id, thread int64, o sourceObject, fill bool
 			return err
 		}
 		if fill && known.Valid {
-			b.decision("message_"+key, id, false, false, true, nil)
+			b.ignored("messages", id, []string{key})
 			continue
 		}
 		var items []json.RawMessage
@@ -753,7 +824,7 @@ func (b *ingestion) messageRelations(id, thread int64, o sourceObject, fill bool
 				if _, err = b.tx.ExecContext(b.ctx, "DELETE FROM message_reactions WHERE message_id=? AND user_id=?", id, user); err != nil {
 					return err
 				}
-				b.decision("message_reactions", id, false, false, false, []string{"removed"})
+				b.decision("message_reactions", id, false, false, []string{"removed"})
 			}
 		case "mentions":
 			type mentionKey struct {
@@ -798,7 +869,7 @@ func (b *ingestion) messageRelations(id, thread int64, o sourceObject, fill bool
 				if n > 0 {
 					fields = []string{"target"}
 				}
-				b.decision("message_mentions", id, false, false, false, fields)
+				b.decision("message_mentions", id, false, false, fields)
 			}
 			rows, err := b.tx.QueryContext(b.ctx, "SELECT offset,length,kind FROM message_mentions WHERE message_id=?", id)
 			if err != nil {
@@ -824,7 +895,7 @@ func (b *ingestion) messageRelations(id, thread int64, o sourceObject, fill bool
 				if _, err = b.tx.ExecContext(b.ctx, "DELETE FROM message_mentions WHERE message_id=? AND offset=? AND length=? AND kind=?", id, k.offset, k.length, k.kind); err != nil {
 					return err
 				}
-				b.decision("message_mentions", id, false, false, false, []string{"removed"})
+				b.decision("message_mentions", id, false, false, []string{"removed"})
 			}
 		}
 		if _, err := b.patch("messages", id, map[string]any{key + "_known": int64(1)}, false); err != nil {
@@ -883,7 +954,7 @@ func (b *ingestion) reaction(msg, thread int64, raw json.RawMessage, remove bool
 	if n > 0 {
 		changed = []string{"reaction"}
 	}
-	b.decision("message_reactions", msg, !exists && !remove, false, false, changed)
+	b.decision("message_reactions", msg, !exists && !remove, false, changed)
 	if b.event > 0 {
 		_, err = b.patch("messages", msg, map[string]any{"reactions_known": int64(1)}, false)
 	}
@@ -914,7 +985,7 @@ func (b *ingestion) delta(raw json.RawMessage, delta slidetypes.Delta) error {
 		var created, bound bool
 		thread, created, bound, err = b.resolve("threads", addAlias(nil, "thread.fbid", "", remote), "thread.fbid", 0)
 		if err == nil {
-			b.decision("threads", thread, created, bound, false, nil)
+			b.decision("threads", thread, created, bound, nil)
 		}
 	}
 	if err != nil {
@@ -925,7 +996,7 @@ func (b *ingestion) delta(raw json.RawMessage, delta slidetypes.Delta) error {
 		return err
 	}
 	if deleted.Bool {
-		b.decision("threads", thread, false, false, true, nil)
+		b.decision("threads", thread, false, false, nil)
 		return nil
 	}
 	var message int64
@@ -946,7 +1017,7 @@ func (b *ingestion) delta(raw json.RawMessage, delta slidetypes.Delta) error {
 			return err
 		}
 		changed, err := b.patch("threads", thread, values, false)
-		b.decision("threads", thread, false, false, false, changed)
+		b.decision("threads", thread, false, false, changed)
 		return err
 	}
 	messagePatch := func(values map[string]any) error {
@@ -954,7 +1025,7 @@ func (b *ingestion) delta(raw json.RawMessage, delta slidetypes.Delta) error {
 			return errors.New("missing target message")
 		}
 		changed, err := b.patch("messages", message, values, false)
-		b.decision("messages", message, false, false, false, changed)
+		b.decision("messages", message, false, false, changed)
 		return err
 	}
 	if message != 0 {
@@ -962,7 +1033,7 @@ func (b *ingestion) delta(raw json.RawMessage, delta slidetypes.Delta) error {
 			return err
 		}
 		if deleted.Bool {
-			b.decision("messages", message, false, false, true, nil)
+			b.decision("messages", message, false, false, nil)
 			return nil
 		}
 	}
@@ -987,11 +1058,11 @@ func (b *ingestion) delta(raw json.RawMessage, delta slidetypes.Delta) error {
 			return err
 		}
 		if prior.Valid && prior.Int64 > d.ReadTimestampMS.UnixMilli() {
-			b.decision("threads", thread, false, false, true, nil)
+			b.decision("threads", thread, false, false, nil)
 			return nil
 		}
 		changed, err := b.patch("threads", thread, values, false)
-		b.decision("threads", thread, false, false, false, changed)
+		b.decision("threads", thread, false, false, changed)
 		return err
 	case *slidetypes.MarkUnreadEvent:
 		return threadPatch(map[string]string{"marked_as_unread": "unread"}, o)
@@ -1015,7 +1086,7 @@ func (b *ingestion) delta(raw json.RawMessage, delta slidetypes.Delta) error {
 			return err
 		}
 		if previous.Valid && previous.Int64 > at {
-			b.decision("messages", message, false, false, true, nil)
+			b.decision("messages", message, false, false, nil)
 			return nil
 		}
 		values["edited_at"] = at
@@ -1033,10 +1104,14 @@ func (b *ingestion) delta(raw json.RawMessage, delta slidetypes.Delta) error {
 		}
 		return messagePatch(values)
 	case *slidetypes.DeleteMessageEvent:
-		return messagePatch(map[string]any{"deleted": int64(1), "body": nil, "snippet": nil, "attachments": nil, "edits": nil})
+		if err := messagePatch(map[string]any{"deleted": int64(1), "body": nil, "snippet": nil, "attachments": nil, "edits": nil}); err != nil {
+			return err
+		}
+		_, err := b.tx.ExecContext(b.ctx, "DELETE FROM media_cache WHERE account_id=? AND message_id=?", b.account, message)
+		return err
 	case *slidetypes.DeleteThreadEvent:
 		changed, err := b.patch("threads", thread, map[string]any{"deleted": int64(1)}, false)
-		b.decision("threads", thread, false, false, false, changed)
+		b.decision("threads", thread, false, false, changed)
 		return err
 	case *slidetypes.UpdateThreadNameEvent:
 		return threadPatch(map[string]string{"thread_name": "title"}, o)

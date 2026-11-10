@@ -17,7 +17,6 @@ import (
 
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
 	"go.mau.fi/mautrix-meta/internal/media"
-	"go.mau.fi/mautrix-meta/internal/projection"
 	"go.mau.fi/mautrix-meta/internal/store"
 )
 
@@ -28,16 +27,16 @@ type Server struct {
 	SDK     *sdk.Server
 }
 type Response struct {
-	Media        []store.Media       `json:"media,omitempty"`
-	Items        []projection.Result `json:"items,omitempty"`
-	Status       []map[string]any    `json:"status,omitempty"`
-	Next         string              `json:"next_cursor,omitempty"`
-	Availability string              `json:"availability,omitempty"`
+	Media        []store.Media    `json:"media,omitempty"`
+	Items        []store.Record   `json:"items,omitempty"`
+	Status       []map[string]any `json:"status,omitempty"`
+	Next         string           `json:"next_cursor,omitempty"`
+	Availability string           `json:"availability,omitempty"`
 }
 
 func New(db *store.Store, account string, cache *media.Cache) *Server {
-	s := &Server{DB: db, Account: account, Cache: cache, SDK: sdk.NewServer(&sdk.Implementation{Name: "igdm-mirror", Version: "3"}, &sdk.ServerOptions{Instructions: "Read-only locally acquired Instagram source observations. Source content is reconstructed losslessly from normalized relational storage; subscription tokens are excluded from archived mailbox roots; source_hash identifies representative acquisition bytes, while normalized_content_hash identifies stored content. Source IDs resolve through account-scoped identities; entity_id and entity: references are stable local identities. source_hash identifies a representative acquisition root, which can contain the returned object as nested content. Use original identifier namespaces (id:, thread_fbid:, message_id:). Partial coverage and reconstruction uncertainty are explicit. No Instagram actions are available."})}
-	tools := map[string]string{"list_accounts": "List locally known accounts and session metadata", "list_chats": "List conversation source snapshots", "get_chat": "Retrieve a conversation by an original namespaced source ID", "get_messages": "Retrieve conversation messages with bounded cursor pagination", "get_message": "Retrieve a message by an original namespaced source ID", "get_user": "Retrieve an identifiable user profile observation", "search_messages": "Search original message text paths with account, thread, sender and time filters", "get_media": "Retrieve locally cached media acquisition metadata", "get_sync_status": "Inspect synchronization coverage, progress, and recoverable gaps"}
+	s := &Server{DB: db, Account: account, Cache: cache, SDK: sdk.NewServer(&sdk.Implementation{Name: "igdm-mirror", Version: "4"}, &sdk.ServerOptions{Instructions: "Read-only Instagram mirror. User, thread, and message IDs refer to current local rows. Namespaced Instagram IDs are accepted for lookup. Use get_sync_status for acquisition coverage."})}
+	tools := map[string]string{"list_accounts": "List locally known accounts and session metadata", "list_chats": "List locally mirrored conversations", "get_chat": "Retrieve a conversation by an original namespaced source ID", "get_messages": "Retrieve conversation messages with bounded cursor pagination", "get_message": "Retrieve a message by an original namespaced source ID", "get_user": "Retrieve a locally mirrored user", "search_messages": "Search current message text with account, thread, sender and time filters", "get_media": "Retrieve locally cached media acquisition metadata", "get_sync_status": "Inspect synchronization coverage, progress, and recoverable gaps"}
 	for name, description := range tools {
 		tool := &sdk.Tool{Name: name, Description: description, OutputSchema: map[string]any{"type": "object", "properties": map[string]any{
 			"media": map[string]any{"type": "array", "items": map[string]any{"type": "object"}}, "items": map[string]any{"type": "array", "items": map[string]any{"type": "object"}},
@@ -56,8 +55,8 @@ func New(db *store.Store, account string, cache *media.Cache) *Server {
 			return nil, out, err
 		})
 	}
-	for _, template := range []string{"igdm://accounts/{account_id}/entities/{kind}/{entity_id}", "igdm://accounts/{account_id}/threads/{thread_id}", "igdm://accounts/{account_id}/threads/{thread_id}/messages/{message_id}", "igdm://accounts/{account_id}/records/{kind}/{record_id}", "igdm://accounts/{account_id}/media/{hash}"} {
-		s.SDK.AddResourceTemplate(&sdk.ResourceTemplate{Name: "Instagram source", URITemplate: template, MIMEType: "application/json"}, s.readResource)
+	for _, template := range []string{"igdm://accounts/{account_id}/entities/{kind}/{entity_id}", "igdm://accounts/{account_id}/threads/{thread_id}", "igdm://accounts/{account_id}/threads/{thread_id}/messages/{message_id}", "igdm://accounts/{account_id}/media/{hash}"} {
+		s.SDK.AddResourceTemplate(&sdk.ResourceTemplate{Name: "Instagram mirror", URITemplate: template, MIMEType: "application/json"}, s.readResource)
 	}
 	return s
 }
@@ -119,16 +118,13 @@ func (s *Server) callSnapshot(ctx context.Context, name string, q store.Query) (
 		return out, err
 	}
 	out.Next = page.Next
-	if (name == "get_chat" || name == "get_message" || name == "get_user") && len(page.Records) > 1 {
-		return out, errors.New("source ID is ambiguous; use an exact record resource")
-	}
-	out.Items = []projection.Result{}
-	for _, r := range page.Records {
-		result, err := projection.Build(ctx, s.DB, r, q.Raw)
-		if err != nil {
-			return out, errors.New("stored source projection failed")
+	out.Items = page.Records
+	for _, r := range out.Items {
+		if r.Message != nil {
+			for i := range r.Message.Attachments {
+				r.Message.Attachments[i].URLs = nil
+			}
 		}
-		out.Items = append(out.Items, result)
 	}
 	out.Availability = "partial"
 	if len(page.Records) == 0 {
@@ -146,7 +142,7 @@ func (s *Server) media(ctx context.Context, q store.Query) (Response, error) {
 		return out, err
 	}
 	for _, r := range page.Records {
-		items, err := s.DB.Media(ctx, q.Account, r.RowID)
+		items, err := s.DB.Media(ctx, q.Account, r.ID)
 		if err != nil {
 			return out, err
 		}
@@ -211,17 +207,7 @@ func (s *Server) readResourceSnapshot(ctx context.Context, req *sdk.ReadResource
 		}
 		return &sdk.ReadResourceResult{Contents: []*sdk.ResourceContents{{URI: uri, MIMEType: m.MIME, Blob: b, Meta: sdk.Meta{"offset": offset, "byte_size": m.Size, "returned_bytes": len(b), "partial": offset != 0 || int64(len(b)) < m.Size}}}}, nil
 	}
-	if parts[1] == "records" && len(parts) == 4 {
-		row, err := strconv.ParseInt(parts[3], 10, 64)
-		if err != nil || row <= 0 {
-			return nil, errors.New("invalid record")
-		}
-		r, err := s.DB.Record(ctx, s.Account, parts[2], row)
-		if err != nil {
-			return nil, errors.New("source record unavailable")
-		}
-		value = r
-	} else if parts[1] == "entities" && len(parts) == 4 {
+	if parts[1] == "entities" && len(parts) == 4 {
 		id, parseErr := strconv.ParseInt(parts[3], 10, 64)
 		if parseErr != nil || id <= 0 {
 			return nil, errors.New("invalid entity reference")
@@ -230,13 +216,13 @@ func (s *Server) readResourceSnapshot(ctx context.Context, req *sdk.ReadResource
 		if name == "" {
 			return nil, errors.New("invalid entity kind")
 		}
-		value, err = s.call(ctx, name, store.Query{Account: parts[0], EntityID: id, Raw: true})
+		value, err = s.call(ctx, name, store.Query{Account: parts[0], EntityID: id})
 		if err != nil {
 			return nil, err
 		}
 	} else if parts[1] == "threads" && (len(parts) == 3 || len(parts) == 5 && parts[3] == "messages") {
 		name := "get_chat"
-		q := store.Query{Account: parts[0], SourceID: parts[2], Raw: true}
+		q := store.Query{Account: parts[0], SourceID: parts[2]}
 		if len(parts) == 5 {
 			name = "get_message"
 			q.SourceID = parts[4]

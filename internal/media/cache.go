@@ -37,9 +37,6 @@ type attachment struct {
 }
 
 func New(db *store.Store, dir string) (*Cache, error) {
-	if err := db.InitializeMedia(); err != nil {
-		return nil, err
-	}
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return nil, err
 	}
@@ -95,7 +92,7 @@ func allowed(u *url.URL) bool {
 	}
 	return false
 }
-func DescribeAttachments(msg slidetypes.Message) []store.Attachment {
+func DescribeAttachments(msg slidetypes.Message, expiring bool) []store.Attachment {
 	out := []store.Attachment{}
 	add := func(ref string, urls ...string) {
 		nonempty := []string{}
@@ -152,7 +149,7 @@ func DescribeAttachments(msg slidetypes.Message) []store.Attachment {
 	case *slidetypes.MessageContentRavenImage, *slidetypes.MessageContentRavenVideo:
 		out = append(out, store.Attachment{Key: "restricted-ephemeral-media", Restricted: true, Kind: msg.ContentType})
 	}
-	if !msg.ExpirationTimestampMS.IsZero() || !msg.ViewExpirationTimestampMS.IsZero() {
+	if expiring {
 		for i := range out {
 			out[i].Restricted = true
 			out[i].URLs = nil
@@ -171,7 +168,7 @@ func (c *Cache) Sync(ctx context.Context, account string) error {
 			return nil
 		}
 		for _, r := range records {
-			prior, err := c.DB.Media(ctx, account, r.RowID)
+			prior, err := c.DB.Media(ctx, account, r.ID)
 			if err != nil {
 				return err
 			}
@@ -179,11 +176,7 @@ func (c *Cache) Sync(ctx context.Context, account string) error {
 			for _, m := range prior {
 				existing[m.Attachment] = m
 			}
-			var msg slidetypes.Message
-			if err := json.Unmarshal(r.Raw, &msg); err != nil {
-				return err
-			}
-			for _, desc := range DescribeAttachments(msg) {
+			for _, desc := range r.Attachments {
 				a := attachment{ref: desc.Key, urls: desc.URLs, blocked: desc.Restricted}
 				m := existing[a.ref]
 				urlBytes, _ := json.Marshal(a.urls)
@@ -191,70 +184,52 @@ func (c *Cache) Sync(ctx context.Context, account string) error {
 				if !a.blocked && m.Status == "available" && c.exists(m.Hash) {
 					continue
 				}
-				if (!a.blocked || m.Status == "restricted" && m.Version == r.RowID) && m.URLHash == urlHash && (m.Status == "unavailable" || m.Status == "restricted" || m.Attempted > time.Now().Add(-time.Hour).UnixMilli()) {
+				if (!a.blocked || m.Status == "restricted") && m.URLHash == urlHash && (m.Status == "unavailable" || m.Status == "restricted" || m.Attempted > time.Now().Add(-time.Hour).UnixMilli()) {
 					continue
 				}
-				m = store.Media{Account: account, Record: r.RowID, Attachment: a.ref, URLHash: urlHash, Attempted: time.Now().UnixMilli(), Attempts: m.Attempts + 1}
-				m.Version = r.RowID
-				if !a.blocked && len(a.urls) > 0 {
-					m.Version, err = c.DB.AttachmentVersion(ctx, account, r.RowID, a.ref, a.urls[0])
-					if err != nil {
-						return err
-					}
-				}
+				m = store.Media{Account: account, MessageID: r.ID, Attachment: a.ref, URLHash: urlHash, Attempted: time.Now().UnixMilli(), Attempts: m.Attempts + 1}
 				if a.blocked {
 					m.Status = "restricted"
 					m.Error = "ephemeral or expired media is not acquired"
 				} else {
-					cached, err := c.DB.CachedMedia(ctx, account, a.ref, urlHash)
-					if err == nil && c.exists(cached.Hash) {
-						m.Status = "available"
-						m.Hash = cached.Hash
-						m.MIME = cached.MIME
-						m.Size = cached.Size
-					} else {
-						if err != nil && !store.NoMedia(err) {
-							return err
+					m.Status = "failed"
+					m.Error = "media retrieval failed; retry pending"
+					for attempt := 0; attempt < 3; attempt++ {
+						terminal := false
+						for _, sourceURL := range a.urls {
+							hash, mime, size, permanent, err := c.download(ctx, sourceURL)
+							if err == nil {
+								m.Status = "available"
+								m.Hash = hash
+								m.MIME = mime
+								m.Size = size
+								m.Error = ""
+								break
+							}
+							terminal = permanent
 						}
-						m.Status = "failed"
-						m.Error = "media retrieval failed; retry pending"
-						for attempt := 0; attempt < 3; attempt++ {
-							terminal := false
-							for _, sourceURL := range a.urls {
-								hash, mime, size, permanent, err := c.download(ctx, sourceURL)
-								if err == nil {
-									m.Status = "available"
-									m.Hash = hash
-									m.MIME = mime
-									m.Size = size
-									m.Error = ""
-									break
-								}
-								terminal = permanent
-							}
-							if m.Status == "available" {
-								break
-							}
-							if terminal {
-								m.Status = "unavailable"
-								m.Error = "source media is inaccessible, unsupported, or exceeds the cache limit"
-								break
-							}
-							t := time.NewTimer(time.Duration(1<<attempt) * time.Second)
-							select {
-							case <-ctx.Done():
-								t.Stop()
-								return ctx.Err()
-							case <-t.C:
-							}
+						if m.Status == "available" {
+							break
+						}
+						if terminal {
+							m.Status = "unavailable"
+							m.Error = "source media is inaccessible, unsupported, or exceeds the cache limit"
+							break
+						}
+						t := time.NewTimer(time.Duration(1<<attempt) * time.Second)
+						select {
+						case <-ctx.Done():
+							t.Stop()
+							return ctx.Err()
+						case <-t.C:
 						}
 					}
 				}
-				if err = c.DB.SaveMedia(ctx, m); err != nil {
+				if err = c.DB.SaveMedia(ctx, m, r.StoredAttachments); err != nil {
 					return err
 				}
 			}
-			after = r.RowID
+			after = r.ID
 		}
 	}
 	return ctx.Err()

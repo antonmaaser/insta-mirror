@@ -234,12 +234,19 @@ func (b *ingestion) inboxThread(raw json.RawMessage, pinned bool) (int64, error)
 	if err != nil {
 		return 0, err
 	}
+	var deleted sql.NullBool
+	if err = b.tx.QueryRowContext(b.ctx, "SELECT deleted FROM threads WHERE id=?", thread).Scan(&deleted); err != nil {
+		return 0, err
+	}
+	if deleted.Bool {
+		return thread, nil
+	}
 	if pinned {
 		fields, err := b.patch("threads", thread, map[string]any{"pinned": int64(1)}, b.fill)
 		if err != nil {
 			return 0, err
 		}
-		b.decision("threads", thread, false, false, b.fill, fields)
+		b.decision("threads", thread, false, false, fields)
 	}
 	prior := b.fill
 	b.fill = true
@@ -330,6 +337,7 @@ func (e *Engine) fetch(ctx context.Context, spec pageSpec, fn func(context.Conte
 	if saveErr := e.DB.SetState(ctx, e.Account, spec.Scope, spec.ID, state); saveErr != nil {
 		return saveErr
 	}
+	e.Log.decisions(e.Account, spec.Scope+":"+spec.ID, []store.Decision{{Kind: "acquisition", Action: "deferred", Reason: state.Error}})
 	return fmt.Errorf("%s %s: %s", spec.Scope, spec.ID, state.Error)
 }
 func (e *Engine) Initialize(ctx context.Context) error {
@@ -448,21 +456,15 @@ func (e *Engine) historyThread(ctx context.Context, id, remote string) error {
 	if err := e.DB.State(ctx, e.Account, "reconciliation", "resnapshot", &gap); err != nil {
 		return err
 	}
-	for _, scope := range []string{"head", "thread"} {
-		var state store.State
-		if err := e.DB.State(ctx, e.Account, scope, id, &state); err != nil {
-			return err
-		}
-		if state.Generation < gap.Timestamp {
-			state = store.State{Generation: gap.Timestamp, Revision: state.Revision + 1}
-			if err := e.DB.SetState(ctx, e.Account, scope, id, state); err != nil {
-				return err
-			}
-		}
-	}
 	var head store.State
 	if err := e.DB.State(ctx, e.Account, "head", id, &head); err != nil {
 		return err
+	}
+	if head.Generation < gap.Timestamp {
+		head = store.State{Generation: gap.Timestamp, Revision: head.Revision + 1}
+		if err := e.DB.SetState(ctx, e.Account, "head", id, head); err != nil {
+			return err
+		}
 	}
 	if head.Complete || head.LastSuccess == 0 {
 		if err := e.fetch(ctx, pageSpec{Scope: "head", ID: id, Remote: remote, Path: "get_slide_thread_nullable", Messages: true, Start: true}, func(ctx context.Context) error {
@@ -476,7 +478,7 @@ func (e *Engine) historyThread(ctx context.Context, id, remote string) error {
 		seen := map[string]bool{}
 		for {
 			var state store.State
-			if err = e.DB.State(ctx, e.Account, scope, id, &state); err != nil {
+			if err := e.DB.State(ctx, e.Account, scope, id, &state); err != nil {
 				return err
 			}
 			if state.Complete {
@@ -485,14 +487,14 @@ func (e *Engine) historyThread(ctx context.Context, id, remote string) error {
 			cursor := state.Cursor
 			if cursor == "" || seen[cursor] {
 				state.Error = "message pagination has no advancing cursor"
-				if err = e.DB.SetState(ctx, e.Account, scope, id, state); err != nil {
+				if err := e.DB.SetState(ctx, e.Account, scope, id, state); err != nil {
 					return err
 				}
 				return errors.New(state.Error)
 			}
 			seen[cursor] = true
 			spec := pageSpec{Scope: scope, ID: id, Remote: remote, Path: "fetch__SlideThread", Messages: true, Previous: cursor}
-			if err = e.fetch(ctx, spec, func(ctx context.Context) error {
+			if err := e.fetch(ctx, spec, func(ctx context.Context) error {
 				_, err := e.Client.PaginateMessages(ctx, &slidetypes.PaginateMessagesRequest{AfterCursor: &cursor, ThreadID: remote, FirstN: 20, InitialMessagePageCount: 20})
 				return err
 			}); err != nil {

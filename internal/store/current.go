@@ -15,13 +15,13 @@ CREATE TABLE users (
  id INTEGER PRIMARY KEY, account_id TEXT NOT NULL, username TEXT, name TEXT, avatar_url TEXT,
  verified INTEGER, restricted INTEGER, blocking INTEGER, following INTEGER, followed_by INTEGER,
  ai_agent_type TEXT, latest_reel INTEGER, latest_besties_reel INTEGER, reel_seen_at INTEGER,
- last_event INTEGER NOT NULL DEFAULT 0, UNIQUE(account_id,id)
+ UNIQUE(account_id,id)
 );
 CREATE TABLE threads (
  id INTEGER PRIMARY KEY, account_id TEXT NOT NULL, title TEXT, image_url TEXT, folder TEXT,
  activity_at INTEGER, subtype TEXT, is_group INTEGER, muted INTEGER, pinned INTEGER,
  unread INTEGER, read_at INTEGER, input_mode INTEGER, reachability TEXT, deleted INTEGER,
- last_event INTEGER NOT NULL DEFAULT 0, UNIQUE(account_id,id)
+ UNIQUE(account_id,id)
 );
 CREATE TABLE messages (
  id INTEGER PRIMARY KEY, account_id TEXT NOT NULL, thread_id INTEGER, sender_id INTEGER, reply_id INTEGER,
@@ -29,7 +29,8 @@ CREATE TABLE messages (
  edited_at INTEGER, expires_at INTEGER, view_expires_at INTEGER, forwarded INTEGER,
  pinned INTEGER, reported INTEGER, ai_generated INTEGER, deleted INTEGER, placeholder INTEGER NOT NULL DEFAULT 1,
  reactions_known INTEGER, mentions_known INTEGER,
- last_event INTEGER NOT NULL DEFAULT 0, UNIQUE(account_id,id),
+ CHECK(placeholder=1 OR (thread_id IS NOT NULL AND sent_at IS NOT NULL)),
+ UNIQUE(account_id,id),
  FOREIGN KEY(account_id,thread_id) REFERENCES threads(account_id,id),
  FOREIGN KEY(account_id,sender_id) REFERENCES users(account_id,id),
  FOREIGN KEY(account_id,reply_id) REFERENCES messages(account_id,id)
@@ -128,9 +129,14 @@ func aliasOwner(ctx context.Context, q interface {
 // The caller rolls back the whole acquisition if any binding disagrees.
 func ResolveAliases(ctx context.Context, tx *sql.Tx, account, kind string, aliases []Alias, canonical, expected int64) (int64, bool, bool, error) {
 	id := expected
+	var missing []Alias
 	for _, a := range aliases {
+		if canonical >= 0 && canonical < int64(len(aliases)) && a.Namespace == aliases[canonical].Namespace && a.Scope == aliases[canonical].Scope && a.RemoteID != aliases[canonical].RemoteID {
+			return id, false, false, ErrConflict
+		}
 		owner, err := aliasOwner(ctx, tx, account, kind, a)
 		if errors.Is(err, sql.ErrNoRows) {
+			missing = append(missing, a)
 			continue
 		}
 		if err != nil {
@@ -166,30 +172,24 @@ func ResolveAliases(ctx context.Context, tx *sql.Tx, account, kind string, alias
 			return 0, false, false, err
 		}
 	}
-	bound := false
-	for _, a := range aliases {
-		result, err := tx.ExecContext(ctx, "INSERT INTO source_ids(account_id,namespace,scope,remote_id,"+aliasColumn(kind)+") VALUES(?,?,?,?,?) ON CONFLICT DO NOTHING", account, a.Namespace, a.Scope, a.RemoteID, id)
+	for _, a := range missing {
+		_, err := tx.ExecContext(ctx, "INSERT INTO source_ids(account_id,namespace,scope,remote_id,"+aliasColumn(kind)+") VALUES(?,?,?,?,?)", account, a.Namespace, a.Scope, a.RemoteID, id)
 		if err != nil {
 			return id, created, false, err
 		}
-		n, err := result.RowsAffected()
-		if err != nil {
-			return id, created, false, err
-		}
-		bound = bound || n > 0
 	}
-	return id, created, bound, nil
+	return id, created, len(missing) > 0, nil
 }
 
 // Patch writes only supplied fields with different values. Field names come
 // from the ingestion code, never from keys supplied by Instagram.
-func Patch(ctx context.Context, tx *sql.Tx, table, where string, keys []any, values map[string]any, fill bool, event int64) ([]string, error) {
+func Patch(ctx context.Context, tx *sql.Tx, table, where string, keys []any, values map[string]any, fill bool) ([]string, []string, error) {
 	var columns []string
 	for name := range values {
 		columns = append(columns, name)
 	}
 	if len(columns) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 	sort.Strings(columns)
 	current := make([]any, len(columns))
@@ -198,13 +198,17 @@ func Patch(ctx context.Context, tx *sql.Tx, table, where string, keys []any, val
 		dest[i] = &current[i]
 	}
 	if err := tx.QueryRowContext(ctx, "SELECT "+strings.Join(columns, ",")+" FROM "+table+" WHERE "+where, keys...).Scan(dest...); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	var changed, set []string
+	var changed, ignored, set []string
 	var args []any
 	for i, name := range columns {
 		value := values[name]
-		if fill && current[i] != nil || current[i] == value {
+		if current[i] == value {
+			continue
+		}
+		if fill && current[i] != nil {
+			ignored = append(ignored, name)
 			continue
 		}
 		changed = append(changed, name)
@@ -212,14 +216,10 @@ func Patch(ctx context.Context, tx *sql.Tx, table, where string, keys []any, val
 		args = append(args, value)
 	}
 	if len(set) == 0 {
-		return nil, nil
-	}
-	if event > 0 {
-		set = append(set, "last_event=?")
-		args = append(args, event)
+		return nil, ignored, nil
 	}
 	_, err := tx.ExecContext(ctx, "UPDATE "+table+" SET "+strings.Join(set, ",")+" WHERE "+where, append(args, keys...)...)
-	return changed, err
+	return changed, ignored, err
 }
 
 func JSONValue(value any) string {
