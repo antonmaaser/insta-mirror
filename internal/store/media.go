@@ -22,7 +22,7 @@ type Media struct {
 }
 
 func (s *Store) InitializeMedia() error {
-	_, err := s.DB.Exec(`CREATE TABLE IF NOT EXISTS media_cache(account_id TEXT NOT NULL,message_record_id INTEGER NOT NULL REFERENCES messages(record_id),attachment_reference TEXT NOT NULL,url_hash TEXT NOT NULL,status TEXT NOT NULL,content_hash TEXT NOT NULL DEFAULT '',mime_type TEXT NOT NULL DEFAULT '',byte_size INTEGER NOT NULL DEFAULT 0,attempts INTEGER NOT NULL DEFAULT 0,last_attempt_ms INTEGER NOT NULL DEFAULT 0,error TEXT NOT NULL DEFAULT '',PRIMARY KEY(account_id,message_record_id,attachment_reference));CREATE INDEX IF NOT EXISTS media_content ON media_cache(account_id,content_hash);CREATE INDEX IF NOT EXISTS media_attachment ON media_cache(account_id,attachment_reference,url_hash)`)
+	_, err := s.DB.Exec(`CREATE TABLE IF NOT EXISTS media_cache(account_id TEXT NOT NULL,message_record_id INTEGER NOT NULL,attachment_reference TEXT NOT NULL,url_hash TEXT NOT NULL,status TEXT NOT NULL,content_hash TEXT NOT NULL DEFAULT '',mime_type TEXT NOT NULL DEFAULT '',byte_size INTEGER NOT NULL DEFAULT 0,attempts INTEGER NOT NULL DEFAULT 0,last_attempt_ms INTEGER NOT NULL DEFAULT 0,error TEXT NOT NULL DEFAULT '',PRIMARY KEY(account_id,message_record_id,attachment_reference),FOREIGN KEY(account_id,message_record_id) REFERENCES source_records(account_id,record_id));CREATE INDEX IF NOT EXISTS media_content ON media_cache(account_id,content_hash);CREATE INDEX IF NOT EXISTS media_attachment ON media_cache(account_id,attachment_reference,url_hash)`)
 	return err
 }
 func (s *Store) SaveMedia(ctx context.Context, m Media) error {
@@ -60,7 +60,7 @@ func (s *Store) MediaHash(ctx context.Context, account, hash string) (Media, err
 	return mediaScan(s.queryRowContext(ctx, `SELECT * FROM media_cache WHERE account_id=? AND content_hash=? AND status='available' LIMIT 1`, account, hash))
 }
 func (s *Store) MessageBatch(ctx context.Context, account string, after int64) ([]Record, error) {
-	rows, err := s.queryContext(ctx, `SELECT record_id,raw FROM messages WHERE account_id=? AND record_id>? ORDER BY record_id LIMIT 100`, account, after)
+	rows, err := s.queryContext(ctx, `SELECT record_id,version_id,content_hash FROM messages WHERE account_id=? AND record_id>? ORDER BY record_id LIMIT 100`, account, after)
 	if err != nil {
 		return nil, err
 	}
@@ -68,13 +68,20 @@ func (s *Store) MessageBatch(ctx context.Context, account string, after int64) (
 	out := []Record{}
 	for rows.Next() {
 		r := Record{Table: "messages", Account: account}
-		var raw string
-		if err = rows.Scan(&r.RowID, &raw); err != nil {
+		if err = rows.Scan(&r.RowID, &r.Version, &r.ContentHash); err != nil {
 			return nil, err
 		}
-		r.Raw = []byte(raw)
 		out = append(out, r)
 	}
-	return out, rows.Err()
+	if err = rows.Err(); err != nil {
+		return nil, err
+	}
+	rows.Close()
+	for i := range out {
+		if err = s.hydrate(ctx, &out[i]); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
 }
 func NoMedia(err error) bool { return errors.Is(err, sql.ErrNoRows) }

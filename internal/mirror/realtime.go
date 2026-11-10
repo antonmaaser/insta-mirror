@@ -44,6 +44,7 @@ func (e *Engine) captureDeltas(ctx context.Context, b []byte) error {
 	var parseFailure bool
 	err := e.archiveTransaction(ctx, func(tx *sql.Tx) error {
 		now := time.Now().UnixMilli()
+		var latest int64
 		for wi, w := range wrappers {
 			for di, raw := range w.Data.Deltas {
 				identity := store.Identity("deltas", raw)
@@ -60,11 +61,14 @@ func (e *Engine) captureDeltas(ctx context.Context, b []byte) error {
 				}
 				var delta slidetypes.Delta
 				decodeErr := json.Unmarshal(raw, &delta)
+				if decodeErr == nil && delta.UQSeqID > latest {
+					latest = delta.UQSeqID
+				}
 				_, unknown := delta.Data.(slidetypes.UnknownEvent)
 				if decodeErr != nil || unknown {
 					label := "unknown delta retained for query-time interpretation"
 					if decodeErr != nil {
-						label = "delta decoding failed; original source retained"
+						label = "delta decoding failed; source content retained"
 						parseFailure = true
 					}
 					if err := store.SaveState(ctx, tx, e.Account, "realtime", "delta:"+identity, store.State{Error: label, SeqID: delta.UQSeqID}); err != nil {
@@ -73,11 +77,30 @@ func (e *Engine) captureDeltas(ctx context.Context, b []byte) error {
 				}
 				msg := field(raw, "message")
 				if object(msg) && store.Identity("messages", msg) != "" {
-					// All nested source bytes are retained even if their typed decoding fails.
+					// All nested source content is retained even if their typed decoding fails.
 					if err := e.message(ctx, tx, msg, store.String(raw, "thread_fbid"), fmt.Sprintf("dgw:%d", delta.UQSeqID), now); err != nil {
 						return err
 					}
 				}
+			}
+		}
+		if !parseFailure && latest > 0 {
+			var prior store.State
+			var state string
+			err := tx.QueryRowContext(ctx, `SELECT state FROM sync_state WHERE account_id=? AND scope='realtime' AND scope_id='checkpoint'`, e.Account).Scan(&state)
+			if err != nil && !errors.Is(err, sql.ErrNoRows) {
+				return err
+			}
+			if state != "" {
+				if err = json.Unmarshal([]byte(state), &prior); err != nil {
+					return err
+				}
+			}
+			if latest > prior.SeqID {
+				prior.SeqID = latest
+				prior.Timestamp = now
+				prior.LastSuccess = now
+				return store.SaveState(ctx, tx, e.Account, "realtime", "checkpoint", prior)
 			}
 		}
 		return nil
@@ -113,7 +136,9 @@ func (e *Engine) event(ctx context.Context, event slidetypes.ClientEvent) error 
 		// The raw batch callback has already archived every delta transactionally.
 		return nil
 	case *slidetypes.SeqIDUpdate:
-		err = e.DB.SetState(ctx, e.Account, "realtime", "checkpoint", store.State{SeqID: v.SeqID, Timestamp: v.Timestamp.UnixMilli(), LastSuccess: time.Now().UnixMilli()})
+		// captureDeltas committed the checkpoint with its source records. The
+		// transport notification must not overwrite it or advance it separately.
+		return nil
 	case *slidetypes.ReconnectionStateUpdate:
 		if e.SaveConnection != nil {
 			err = e.SaveConnection(v.State)

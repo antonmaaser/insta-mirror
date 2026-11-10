@@ -51,7 +51,7 @@ func (s *Store) ThreadReferences(ctx context.Context, account, ref string) ([]st
 	if err != nil {
 		return nil, err
 	}
-	rows, err := s.queryContext(ctx, `SELECT DISTINCT id,thread_fbid FROM threads WHERE account_id=? AND `+col+`=?`, account, value)
+	rows, err := s.queryContext(ctx, `SELECT DISTINCT id,thread_fbid FROM threads WHERE account_id=? AND (`+col+`=? OR source_identity=?)`, account, value, ref)
 	if err != nil {
 		return nil, err
 	}
@@ -124,8 +124,8 @@ func (s *Store) Query(ctx context.Context, table string, q Query) (Page, error) 
 		if err != nil {
 			return out, err
 		}
-		outer += ` AND ` + col + `=?`
-		outerArgs = append(outerArgs, value)
+		outer += ` AND (` + col + `=? OR source_identity=?)`
+		outerArgs = append(outerArgs, value, q.SourceID)
 	}
 	if table == "messages" {
 		if q.ThreadID != "" {
@@ -134,7 +134,7 @@ func (s *Store) Query(ctx context.Context, table string, q Query) (Page, error) 
 				return out, err
 			}
 			placeholders := strings.TrimSuffix(strings.Repeat("?,", len(refs)), ",")
-			outer += ` AND (thread_fbid IN (` + placeholders + `) OR acquired_thread_id IN (` + placeholders + `))`
+			outer += ` AND (thread_fbid IN (` + placeholders + `) OR EXISTS (SELECT 1 FROM source_acquisitions a WHERE a.record_id=ranked.record_id AND a.acquired_thread_id IN (` + placeholders + `)))`
 			for range 2 {
 				for _, ref := range refs {
 					outerArgs = append(outerArgs, ref)
@@ -157,10 +157,10 @@ func (s *Store) Query(ctx context.Context, table string, q Query) (Page, error) 
 			if len(q.Text) > 2000 {
 				return out, errors.New("text query too long")
 			}
-			outer += ` AND (instr(lower(coalesce(json_extract(raw,'$.text_body'),'')),lower(?))>0 OR instr(lower(coalesce(json_extract(raw,'$.content.text_body'),'')),lower(?))>0 OR instr(lower(coalesce(json_extract(raw,'$.content.xma_text_body'),'')),lower(?))>0 OR instr(lower(coalesce(json_extract(raw,'$.content.xma.caption_body_text'),'')),lower(?))>0 OR instr(lower(coalesce(json_extract(raw,'$.igd_snippet'),'')),lower(?))>0)`
+			outer += ` AND (instr(lower(coalesce(text_body,'')),lower(?))>0 OR instr(lower(coalesce(content_text,'')),lower(?))>0 OR instr(lower(coalesce(xma_text,'')),lower(?))>0 OR instr(lower(coalesce(caption_text,'')),lower(?))>0 OR instr(lower(coalesce(igd_snippet,'')),lower(?))>0)`
 			// Edits remain source deltas; match their text without manufacturing a
 			// replacement message object. Projection returns their source references.
-			outer = strings.TrimSuffix(outer, ")") + ` OR EXISTS (SELECT 1 FROM deltas d WHERE d.account_id=ranked.account_id AND (d.message_id=ranked.message_id OR d.message_id=ranked.id) AND (d.thread_fbid=ranked.thread_fbid OR d.thread_fbid=ranked.acquired_thread_id) AND instr(lower(coalesce(json_extract(d.raw,'$.text_body'),'')),lower(?))>0))`
+			outer = strings.TrimSuffix(outer, ")") + ` OR EXISTS (SELECT 1 FROM deltas d WHERE d.account_id=ranked.account_id AND (d.message_id=ranked.message_id OR d.message_id=ranked.id OR d.nested_message_id=ranked.id OR d.nested_message_source_id=ranked.message_id) AND (d.thread_fbid=ranked.thread_fbid OR d.thread_fbid=ranked.acquired_thread_id) AND instr(lower(coalesce(d.text_body,'')),lower(?))>0))`
 			for range 6 {
 				outerArgs = append(outerArgs, q.Text)
 			}
@@ -168,13 +168,13 @@ func (s *Store) Query(ctx context.Context, table string, q Query) (Page, error) 
 	}
 	rankOrder := "last_observed_at_ms DESC,record_id DESC"
 	if table == "users" {
-		rankOrder = "(json_type(raw,'$.username') IS NOT NULL) DESC,(json_type(raw,'$.full_name') IS NOT NULL) DESC," + rankOrder
+		rankOrder = "(username IS NOT NULL) DESC,(full_name IS NOT NULL) DESC," + rankOrder
 	}
 	rankFilter := "rank=1"
 	if q.Text != "" {
 		rankFilter = "rank>=1"
 	}
-	sqlText := `WITH ranked AS (SELECT *,row_number() OVER(PARTITION BY source_identity ORDER BY ` + rankOrder + `) AS rank FROM ` + table + ` WHERE ` + where + `) SELECT record_id,account_id,source_identity,acquired_thread_id,origin,observed_at_ms,last_observed_at_ms,source_hash,raw FROM ranked WHERE ` + rankFilter + ` AND ` + outer + ` ORDER BY record_id DESC LIMIT ?`
+	sqlText := `WITH ranked AS (SELECT *,row_number() OVER(PARTITION BY source_identity ORDER BY ` + rankOrder + `) AS rank FROM ` + table + ` WHERE ` + where + `) SELECT record_id,account_id,source_identity,acquired_thread_id,origin,observed_at_ms,last_observed_at_ms,source_hash,version_id,content_hash FROM ranked WHERE ` + rankFilter + ` AND ` + outer + ` ORDER BY record_id DESC LIMIT ?`
 	args = append(args, outerArgs...)
 	args = append(args, q.Limit+1)
 	rows, err := s.queryContext(ctx, sqlText, args...)
@@ -182,25 +182,39 @@ func (s *Store) Query(ctx context.Context, table string, q Query) (Page, error) 
 		return out, err
 	}
 	defer rows.Close()
-	size := 0
 	for rows.Next() {
 		var r Record
-		var raw string
 		r.Table = table
-		if err = rows.Scan(&r.RowID, &r.Account, &r.Identity, &r.Thread, &r.Origin, &r.Observed, &r.LastObserved, &r.Hash, &raw); err != nil {
+		if err = rows.Scan(&r.RowID, &r.Account, &r.Identity, &r.Thread, &r.Origin, &r.Observed, &r.LastObserved, &r.Hash, &r.Version, &r.ContentHash); err != nil {
 			return out, err
 		}
-		if len(out.Records) == q.Limit || (size+len(raw) > 2<<20 && len(out.Records) > 0) {
+		if len(out.Records) == q.Limit {
 			pos.Before = out.Records[len(out.Records)-1].RowID
 			b, _ := json.Marshal(pos)
 			out.Next = base64.RawURLEncoding.EncodeToString(b)
 			break
 		}
-		r.Raw = json.RawMessage(raw)
-		size += len(raw)
 		out.Records = append(out.Records, r)
 	}
-	return out, rows.Err()
+	if err = rows.Err(); err != nil {
+		return out, err
+	}
+	rows.Close()
+	size := 0
+	for i := range out.Records {
+		if err = s.hydrate(ctx, &out.Records[i]); err != nil {
+			return out, err
+		}
+		size += len(out.Records[i].Raw)
+		if size > 2<<20 && i+1 < len(out.Records) {
+			pos.Before = out.Records[i].RowID
+			b, _ := json.Marshal(pos)
+			out.Next = base64.RawURLEncoding.EncodeToString(b)
+			out.Records = out.Records[:i+1]
+			break
+		}
+	}
+	return out, nil
 }
 func (s *Store) Deltas(ctx context.Context, account string, threads []string, messageIDs []string) ([]Record, bool, error) {
 	if len(threads) == 0 {
@@ -216,13 +230,13 @@ func (s *Store) Deltas(ctx context.Context, account string, threads []string, me
 	if len(messageIDs) > 0 {
 		var cond []string
 		for _, id := range messageIDs {
-			cond = append(cond, `message_id=? OR json_extract(raw,'$.message.message_id')=? OR json_extract(raw,'$.message.id')=?`)
+			cond = append(cond, `message_id=? OR nested_message_source_id=? OR nested_message_id=?`)
 			args = append(args, id, id, id)
 		}
 		// Thread deletion changes message availability as well.
 		where += ` AND ((` + strings.Join(cond, " OR ") + `) OR __typename='SlideUQPPDeleteThread')`
 	}
-	rows, err := s.queryContext(ctx, `SELECT record_id,source_identity,origin,observed_at_ms,last_observed_at_ms,source_hash,raw FROM deltas WHERE `+where+` ORDER BY CAST(uq_seq_id AS INTEGER),record_id LIMIT 201`, args...)
+	rows, err := s.queryContext(ctx, `SELECT record_id,source_identity,origin,observed_at_ms,last_observed_at_ms,source_hash,version_id,content_hash FROM deltas WHERE `+where+` ORDER BY CAST(uq_seq_id AS INTEGER),record_id LIMIT 201`, args...)
 	if err != nil {
 		return nil, false, err
 	}
@@ -230,18 +244,25 @@ func (s *Store) Deltas(ctx context.Context, account string, threads []string, me
 	out := []Record{}
 	for rows.Next() {
 		r := Record{Account: account, Table: "deltas"}
-		var raw string
-		if err = rows.Scan(&r.RowID, &r.Identity, &r.Origin, &r.Observed, &r.LastObserved, &r.Hash, &raw); err != nil {
+		if err = rows.Scan(&r.RowID, &r.Identity, &r.Origin, &r.Observed, &r.LastObserved, &r.Hash, &r.Version, &r.ContentHash); err != nil {
 			return nil, false, err
 		}
-		r.Raw = json.RawMessage(raw)
 		out = append(out, r)
 	}
 	more := len(out) > 200
 	if more {
 		out = out[:200]
 	}
-	return out, more, rows.Err()
+	if err = rows.Err(); err != nil {
+		return nil, false, err
+	}
+	rows.Close()
+	for i := range out {
+		if err = s.hydrate(ctx, &out[i]); err != nil {
+			return nil, false, err
+		}
+	}
+	return out, more, nil
 }
 func SourceRef(r Record) string {
 	return fmt.Sprintf("igdm://accounts/%s/records/%s/%s", r.Account, r.Table, strconv.FormatInt(r.RowID, 10))
@@ -252,8 +273,10 @@ func (s *Store) Record(ctx context.Context, account, table string, id int64) (Re
 	if table != "threads" && table != "messages" && table != "users" && table != "deltas" {
 		return r, errors.New("invalid source kind")
 	}
-	var raw string
-	err := s.queryRowContext(ctx, `SELECT record_id,source_identity,acquired_thread_id,origin,observed_at_ms,last_observed_at_ms,source_hash,raw FROM `+table+` WHERE account_id=? AND record_id=?`, account, id).Scan(&r.RowID, &r.Identity, &r.Thread, &r.Origin, &r.Observed, &r.LastObserved, &r.Hash, &raw)
-	r.Raw = json.RawMessage(raw)
+	err := s.queryRowContext(ctx, `SELECT record_id,source_identity,acquired_thread_id,origin,observed_at_ms,last_observed_at_ms,source_hash,version_id,content_hash FROM `+table+` WHERE account_id=? AND record_id=?`, account, id).Scan(&r.RowID, &r.Identity, &r.Thread, &r.Origin, &r.Observed, &r.LastObserved, &r.Hash, &r.Version, &r.ContentHash)
+	if err != nil {
+		return r, err
+	}
+	err = s.hydrate(ctx, &r)
 	return r, err
 }

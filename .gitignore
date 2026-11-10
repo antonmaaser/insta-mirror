@@ -8,3 +8,6 @@
 /sessions/
 /data/
 /session.key
+
+/archive/
+.DS_Store

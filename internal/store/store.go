@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -22,16 +21,29 @@ type Store struct {
 }
 
 type Record struct {
-	Table        string          `json:"kind"`
-	RowID        int64           `json:"record_id"`
-	Account      string          `json:"account_id"`
-	Identity     string          `json:"source_identity"`
-	Thread       string          `json:"acquired_thread_id,omitempty"`
-	Origin       string          `json:"origin"`
-	Observed     int64           `json:"observed_at_ms"`
-	LastObserved int64           `json:"last_observed_at_ms"`
-	Hash         string          `json:"source_hash"`
-	Raw          json.RawMessage `json:"raw,omitempty"`
+	Table          string          `json:"kind"`
+	RowID          int64           `json:"record_id"`
+	Account        string          `json:"account_id"`
+	Identity       string          `json:"source_identity"`
+	Thread         string          `json:"acquired_thread_id,omitempty"`
+	Origin         string          `json:"origin"`
+	Observed       int64           `json:"observed_at_ms"`
+	LastObserved   int64           `json:"last_observed_at_ms"`
+	Hash           string          `json:"source_hash"`
+	Raw            json.RawMessage `json:"raw,omitempty"`
+	Version        int64           `json:"-"`
+	ContentHash    string          `json:"normalized_content_hash"`
+	Representation string          `json:"representation"`
+	Acquisitions   []Acquisition   `json:"acquisitions,omitempty"`
+}
+
+// Acquisition identifies how a version was observed, independently of its content.
+type Acquisition struct {
+	Origin       string `json:"origin"`
+	Thread       string `json:"acquired_thread_id,omitempty"`
+	Hash         string `json:"source_hash"`
+	Observed     int64  `json:"observed_at_ms"`
+	LastObserved int64  `json:"last_observed_at_ms"`
 }
 
 type State struct {
@@ -45,7 +57,22 @@ type State struct {
 	Gaps        []string `json:"gaps,omitempty"`
 }
 
+const schemaVersion = 3
+
 func Open(path string) (*Store, error) {
+	// Reject incompatible files before permissions, journal mode, or schema change.
+	if _, err := os.Stat(path); err == nil {
+		existing, err := OpenReadOnly(context.Background(), path)
+		if err != nil {
+			return nil, err
+		}
+		if err = existing.Close(); err != nil {
+			return nil, err
+		}
+	} else if !os.IsNotExist(err) {
+		return nil, err
+	}
+
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		return nil, err
 	}
@@ -79,10 +106,6 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
-	if _, err = db.Exec("PRAGMA user_version=2"); err != nil {
-		db.Close()
-		return nil, err
-	}
 	return s, nil
 }
 func (s *Store) Close() error { return s.DB.Close() }
@@ -96,43 +119,13 @@ func (s *Store) initialize() error {
 	if err := s.DB.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
 		return err
 	}
-	if version > 2 {
-		return fmt.Errorf("unsupported schema version %d", version)
+	if version == schemaVersion {
+		return nil
 	}
-	tx, err := s.DB.Begin()
-	if err != nil {
-		return err
+	if version != 0 {
+		return fmt.Errorf("incompatible mirror schema version %d", version)
 	}
-	defer tx.Rollback()
-	fields := map[string][]string{
-		"threads":  {"id", "thread_id", "thread_fbid", "thread_key", "thread_subtype", "system_folder", "last_activity_timestamp_ms"},
-		"messages": {"id", "message_id", "thread_fbid", "sender_fbid", "timestamp_ms", "replied_to_message_id", "offline_threading_id"},
-		"users":    {"id", "pk", "fbid_v2", "interop_messaging_user_fbid", "username"},
-		"deltas":   {"uq_seq_id", "__typename", "thread_fbid", "message_id"},
-	}
-	for table, cols := range fields {
-		q := `CREATE TABLE IF NOT EXISTS ` + table + ` (record_id INTEGER PRIMARY KEY, account_id TEXT NOT NULL, source_identity TEXT NOT NULL, acquired_thread_id TEXT NOT NULL DEFAULT '', origin TEXT NOT NULL, observed_at_ms INTEGER NOT NULL, last_observed_at_ms INTEGER NOT NULL, source_hash TEXT NOT NULL, raw TEXT NOT NULL CHECK(json_valid(raw))`
-		for _, col := range cols {
-			q += `, ` + col + ` TEXT GENERATED ALWAYS AS (CAST(json_extract(raw,'$.` + col + `') AS TEXT)) VIRTUAL`
-		}
-		if table == "messages" {
-			q += `, content_type TEXT GENERATED ALWAYS AS (json_extract(raw,'$.content.__typename')) VIRTUAL`
-		}
-		q += `, UNIQUE(account_id,source_identity,source_hash,acquired_thread_id,origin))`
-		if _, err = tx.Exec(q); err != nil {
-			return err
-		}
-		for _, col := range append(cols, "source_identity", "acquired_thread_id") {
-			if _, err = tx.Exec(`CREATE INDEX IF NOT EXISTS ` + table + `_` + col + ` ON ` + table + `(account_id,` + col + `)`); err != nil {
-				return err
-			}
-		}
-	}
-	_, err = tx.Exec(`CREATE TABLE IF NOT EXISTS sync_state(account_id TEXT NOT NULL, scope TEXT NOT NULL, scope_id TEXT NOT NULL, state TEXT NOT NULL CHECK(json_valid(state)), PRIMARY KEY(account_id,scope,scope_id)); PRAGMA user_version=1`)
-	if err != nil {
-		return err
-	}
-	return tx.Commit()
+	return s.Transaction(context.Background(), func(tx *sql.Tx) error { return createSchema(tx) })
 }
 func String(raw json.RawMessage, key string) string {
 	var obj map[string]json.RawMessage
@@ -163,7 +156,8 @@ func Put(ctx context.Context, tx *sql.Tx, r Record) error {
 	if r.Table != "threads" && r.Table != "messages" && r.Table != "users" && r.Table != "deltas" {
 		return errors.New("invalid source table")
 	}
-	if !json.Valid(r.Raw) || !strings.HasPrefix(strings.TrimSpace(string(r.Raw)), "{") {
+	node, err := parseSource(r.Raw)
+	if err != nil || node.shape != '{' {
 		return errors.New("source must be a JSON object")
 	}
 	if r.Account == "" {
@@ -178,9 +172,19 @@ func Put(ctx context.Context, tx *sql.Tx, r Record) error {
 	if r.Observed == 0 {
 		r.Observed = time.Now().UnixMilli()
 	}
-	_, err := tx.ExecContext(ctx, `INSERT INTO `+r.Table+`(account_id,source_identity,acquired_thread_id,origin,observed_at_ms,last_observed_at_ms,source_hash,raw) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(account_id,source_identity,source_hash,acquired_thread_id,origin) DO UPDATE SET last_observed_at_ms=max(last_observed_at_ms,excluded.last_observed_at_ms)`, r.Account, r.Identity, r.Thread, r.Origin, r.Observed, r.Observed, Hash(r.Raw), string(r.Raw))
+	version, err := putVersion(ctx, tx, r.Account, r.Table, node)
+	if err != nil {
+		return err
+	}
+	var record int64
+	err = tx.QueryRowContext(ctx, `INSERT INTO source_records(account_id,kind,source_identity,version_id,observed_at_ms,last_observed_at_ms) VALUES(?,?,?,?,?,?) ON CONFLICT(account_id,kind,source_identity,version_id) DO UPDATE SET observed_at_ms=min(observed_at_ms,excluded.observed_at_ms),last_observed_at_ms=max(last_observed_at_ms,excluded.last_observed_at_ms) RETURNING record_id`, r.Account, r.Table, r.Identity, version, r.Observed, r.Observed).Scan(&record)
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO source_acquisitions(record_id,origin,acquired_thread_id,source_hash,observed_at_ms,last_observed_at_ms) VALUES(?,?,?,?,?,?) ON CONFLICT(record_id,origin,acquired_thread_id,source_hash) DO UPDATE SET observed_at_ms=min(observed_at_ms,excluded.observed_at_ms),last_observed_at_ms=max(last_observed_at_ms,excluded.last_observed_at_ms)`, record, r.Origin, r.Thread, Hash(r.Raw), r.Observed, r.Observed)
 	return err
 }
+
 func SaveState(ctx context.Context, tx *sql.Tx, account, scope, id string, state any) error {
 	b, err := json.Marshal(state)
 	if err != nil {
