@@ -17,6 +17,8 @@ import (
 	"go.mau.fi/mautrix-meta/pkg/messagix/httpclient"
 )
 
+const initialMailboxOperation = "PolarisDirectInboxQuery"
+
 type captureKey struct{}
 type captureFunc func(context.Context, string, []byte) error
 
@@ -297,7 +299,7 @@ func (e *Engine) fetch(ctx context.Context, spec pageSpec, fn func(context.Conte
 		}
 		captured := false
 		callCtx := context.WithValue(ctx, captureKey{}, captureFunc(func(ctx context.Context, operation string, b []byte) error {
-			expected := map[string]string{"get_slide_mailbox_for_iris_subscription": "PolarisDirectInboxQuery", "fetch__SlideMailbox": "IGDThreadListOffMsysPaginationQuery", "get_slide_thread_nullable": "IGDThreadDetailQuery", "fetch__SlideThread": "IGDMessageListOffMsysQuery"}[spec.Path]
+			expected := map[string]string{"get_slide_mailbox_for_iris_subscription": initialMailboxOperation, "fetch__SlideMailbox": "IGDThreadListOffMsysPaginationQuery", "get_slide_thread_nullable": "IGDThreadDetailQuery", "fetch__SlideThread": "IGDMessageListOffMsysQuery"}[spec.Path]
 			if operation != expected {
 				return nil
 			}
@@ -345,7 +347,57 @@ func (e *Engine) Initialize(ctx context.Context) error {
 	if err := e.DB.State(ctx, e.Account, "folder", "INBOX", &saved); err != nil {
 		return err
 	}
-	return e.fetch(ctx, pageSpec{Scope: "folder", ID: "INBOX", Path: "get_slide_mailbox_for_iris_subscription", Preserve: !saved.Complete && saved.Cursor != "", Start: true}, func(ctx context.Context) error { _, _, err := e.Client.LoadIndex(ctx); return err })
+	spec := pageSpec{Scope: "folder", ID: "INBOX", Path: "get_slide_mailbox_for_iris_subscription", Preserve: !saved.Complete && saved.Cursor != "", Start: true}
+	return e.fetch(ctx, spec, func(ctx context.Context) error {
+		// LoadIndex returns the authenticated viewer after fetching the mailbox.
+		// Hold this response until the viewer's identity has been stored.
+		var mailbox []byte
+		loadCtx := context.WithValue(ctx, captureKey{}, captureFunc(func(_ context.Context, operation string, raw []byte) error {
+			if operation == initialMailboxOperation {
+				mailbox = append([]byte(nil), raw...)
+			}
+			return nil
+		}))
+		viewer, _, err := e.Client.LoadIndex(loadCtx)
+		if err != nil {
+			return err
+		}
+		if viewer == nil || viewer.Data.Fbid != e.Account {
+			return acquisitionError{errors.New("authenticated viewer does not match mirror account")}
+		}
+
+		aliases := addAlias(nil, "user.igid", "", e.Account)
+		if fbid := e.Client.GetOwnFBID(); fbid > 0 {
+			aliases = addAlias(aliases, "user.messaging_fbid", "", strconv.FormatInt(fbid, 10))
+		}
+		values := map[string]any{}
+		for field, value := range map[string]string{
+			"name": viewer.GetName(), "username": viewer.GetUsername(), "avatar_url": viewer.GetAvatarURL(),
+		} {
+			if value != "" {
+				values[field] = value
+			}
+		}
+		err = e.ingestTransaction(ctx, "authenticated viewer", func(b *ingestion) error {
+			id, created, bound, err := b.resolve("users", aliases, "user.igid", 0)
+			if err != nil {
+				return b.relationshipError("owner identity", id, err)
+			}
+			fields, err := b.patch("users", id, values, false)
+			if err != nil {
+				return err
+			}
+			b.decision("users", id, created, bound, fields)
+			return nil
+		})
+		if err != nil {
+			return acquisitionError{err}
+		}
+		if mailbox == nil {
+			return errors.New("source response was not captured")
+		}
+		return captureGraphQL(ctx, initialMailboxOperation, mailbox)
+	})
 }
 func (e *Engine) History(ctx context.Context) error {
 	// PENDING and SPAM are upstream source folder identifiers; each request must

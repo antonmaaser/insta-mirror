@@ -136,6 +136,17 @@ func (b *ingestion) resolve(kind string, aliases []store.Alias, primary string, 
 	return id, created, bound, err
 }
 
+func (b *ingestion) relationshipError(relationship string, id int64, err error) error {
+	action := "deferred"
+	if errors.Is(err, store.ErrConflict) {
+		action = "conflict"
+	}
+	b.decisions = append(b.decisions, store.Decision{
+		Kind: "relationship", ID: id, Action: action, Fields: []string{relationship}, Reason: err.Error(),
+	})
+	return fmt.Errorf("%s: %w", relationship, err)
+}
+
 func (b *ingestion) decision(kind string, id int64, created, bound bool, fields []string) {
 	action, reason := "unchanged", "values match"
 	if bound {
@@ -528,6 +539,41 @@ func (b *ingestion) receipt(thread int64, raw json.RawMessage) error {
 	return b.member(thread, user, values, b.fill)
 }
 
+func (b *ingestion) sender(o sourceObject, fill bool) (int64, error) {
+	fbid := o.id("sender_fbid")
+	if !object(o["sender"]) {
+		if fbid == "" {
+			return 0, nil
+		}
+		return b.userRef("user.messaging_fbid", fbid)
+	}
+
+	sender, err := decodeObject(o["sender"])
+	if err != nil {
+		return 0, err
+	}
+	profile := sender["user_dict"]
+	igid := sender.id("igid")
+	if object(profile) {
+		user, err := decodeObject(profile)
+		if err != nil {
+			return 0, err
+		}
+		interop := user.id("interop_messaging_user_fbid")
+		if fbid != "" && interop != "" && fbid != interop {
+			return 0, store.ErrConflict
+		}
+		if fbid == "" && igid == "" && interop == "" && user.id("id") == "" && user.id("pk") == "" && user.id("igid") == "" && user.id("fbid_v2") == "" {
+			fbid = sender.id("id")
+		}
+	} else if fbid == "" && igid == "" {
+		// A sender wrapper ID alone is only useful if its messaging alias
+		// already exists. Without an Instagram ID, user cannot allocate a row.
+		fbid = sender.id("id")
+	}
+	return b.user(profile, igid, fbid, sender.id("name"), fill)
+}
+
 var messageFields = map[string]string{
 	"timestamp_ms": "sent_at", "text_body": "body", "content_type": "kind", "igd_snippet": "snippet",
 	"expiration_timestamp_ms": "expires_at", "view_expiration_timestamp_ms": "view_expires_at",
@@ -572,14 +618,14 @@ func (b *ingestion) message(raw json.RawMessage, thread int64, quote bool) (int6
 	if ref := o.id("thread_fbid"); ref != "" {
 		resolved, created, bound, err := b.resolve("threads", addAlias(nil, "thread.fbid", "", ref), "thread.fbid", thread)
 		if err != nil {
-			return 0, err
+			return 0, b.relationshipError("message thread", id, err)
 		}
 		thread = resolved
 		b.decision("threads", thread, created, bound, nil)
 	}
 	fields, err := b.messageThread(id, thread)
 	if err != nil {
-		return 0, err
+		return 0, b.relationshipError("message thread", id, err)
 	}
 	fill := b.fill || quote
 	var deleted, placeholder int64
@@ -595,27 +641,11 @@ func (b *ingestion) message(raw json.RawMessage, thread int64, quote bool) (int6
 	if err != nil {
 		return 0, err
 	}
-	if rawSender := o["sender"]; len(rawSender) > 0 && string(rawSender) != "null" {
-		sender, err := decodeObject(rawSender)
-		if err != nil {
-			return 0, err
-		}
-		igid := sender.id("igid")
-		if igid == "" {
-			igid = sender.id("id")
-		} else if alt := sender.id("id"); alt != "" && alt != igid {
-			return 0, store.ErrConflict
-		}
-		uid, err := b.user(sender["user_dict"], igid, o.id("sender_fbid"), sender.id("name"), fill)
-		if err != nil {
-			return 0, err
-		}
-		values["sender_id"] = uid
-	} else if fbid := o.id("sender_fbid"); fbid != "" {
-		uid, err := b.userRef("user.messaging_fbid", fbid)
-		if err != nil {
-			return 0, err
-		}
+	uid, err := b.sender(o, fill)
+	if err != nil {
+		return 0, b.relationshipError("sender identity", id, err)
+	}
+	if uid != 0 {
 		values["sender_id"] = uid
 	}
 	if !quote {
@@ -623,22 +653,22 @@ func (b *ingestion) message(raw json.RawMessage, thread int64, quote bool) (int6
 		if ref := o.id("replied_to_message_id"); ref != "" {
 			reply, err = b.messageRef(ref, thread)
 			if err != nil {
-				return 0, err
+				return 0, b.relationshipError("reply target", id, err)
 			}
 		}
 		if nested := o["replied_to_message"]; len(nested) > 0 && string(nested) != "null" {
 			other, err := b.message(nested, thread, true)
 			if err != nil {
-				return 0, err
+				return 0, b.relationshipError("reply target", id, err)
 			}
 			if reply != 0 && other != reply {
-				return 0, store.ErrConflict
+				return 0, b.relationshipError("reply target", id, store.ErrConflict)
 			}
 			reply = other
 		}
 		if reply != 0 {
 			if reply == id {
-				return 0, store.ErrConflict
+				return 0, b.relationshipError("reply target", id, store.ErrConflict)
 			}
 			values["reply_id"] = reply
 		}
@@ -912,7 +942,7 @@ func (b *ingestion) reaction(msg, thread int64, raw json.RawMessage, remove bool
 	}
 	user, err := b.userRef("user.messaging_fbid", o.id("sender_fbid"))
 	if err != nil {
-		return 0, err
+		return 0, b.relationshipError("reaction actor", msg, err)
 	}
 	var exists bool
 	if err = b.tx.QueryRowContext(b.ctx, "SELECT EXISTS(SELECT 1 FROM message_reactions WHERE message_id=? AND user_id=?)", msg, user).Scan(&exists); err != nil {
