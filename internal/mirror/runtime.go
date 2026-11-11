@@ -66,11 +66,20 @@ func Run(ctx context.Context, args []string) (runErr error) {
 	httpAddress := fs.String("http", "", "optional MCP HTTP listen address, e.g. 127.0.0.1:8080")
 	httpToken := fs.String("http-token-file", "", "owner-only MCP bearer token file (required for non-loopback HTTP)")
 	allowNetwork := fs.Bool("allow-network", false, "allow explicit HTTP network exposure")
+	mediaExplorer := fs.Bool("media-explorer", false, "serve the media explorer at /media (HTTP defaults to 127.0.0.1:8080)")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
 	if fs.NArg() != 0 {
 		return fmt.Errorf("unexpected arguments")
+	}
+	if *mediaExplorer {
+		if command != "serve" {
+			return errors.New("--media-explorer requires serve")
+		}
+		if *httpAddress == "" {
+			*httpAddress = "127.0.0.1:8080"
+		}
 	}
 	if *dir == "" {
 		return fmt.Errorf("data directory must not be empty")
@@ -218,7 +227,7 @@ func Run(ctx context.Context, args []string) (runErr error) {
 			}
 			done <- syncErr
 		}()
-		serveErr := mcp.New(db, session.Account, cache).Run(ctx, *httpAddress, *httpToken, *allowNetwork)
+		serveErr := mcp.New(db, session.Account, cache).Run(ctx, *httpAddress, *httpToken, *allowNetwork, *mediaExplorer)
 		abort(context.Canceled)
 		c.Disconnect()
 		<-done

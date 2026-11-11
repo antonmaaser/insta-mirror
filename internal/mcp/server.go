@@ -242,7 +242,12 @@ func (s *Server) readResourceSnapshot(ctx context.Context, req *sdk.ReadResource
 	}
 	return &sdk.ReadResourceResult{Contents: []*sdk.ResourceContents{{URI: uri, MIMEType: "application/json", Text: string(b)}}}, nil
 }
-func (s *Server) Run(ctx context.Context, address, tokenFile string, allowNetwork bool) error {
+func loopbackHost(host string) bool {
+	ip := net.ParseIP(host)
+	return strings.EqualFold(host, "localhost") || ip != nil && ip.IsLoopback()
+}
+
+func (s *Server) Run(ctx context.Context, address, tokenFile string, allowNetwork, mediaExplorer bool) error {
 	if address == "" {
 		return s.SDK.Run(ctx, &sdk.StdioTransport{})
 	}
@@ -250,8 +255,7 @@ func (s *Server) Run(ctx context.Context, address, tokenFile string, allowNetwor
 	if err != nil {
 		return fmt.Errorf("HTTP address requires host:port: %w", err)
 	}
-	ip := net.ParseIP(host)
-	loopback := host == "localhost" || ip != nil && ip.IsLoopback()
+	loopback := loopbackHost(host)
 	if !loopback && !allowNetwork {
 		return errors.New("non-loopback HTTP requires --allow-network")
 	}
@@ -280,13 +284,21 @@ func (s *Server) Run(ctx context.Context, address, tokenFile string, allowNetwor
 		expected = sha256.Sum256(trimmed)
 		clear(token)
 	}
-	handler := sdk.NewStreamableHTTPHandler(func(*http.Request) *sdk.Server { return s.SDK }, nil)
-	mcpHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if requireToken {
-			value, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
-			presented := sha256.Sum256([]byte(value))
-			if !ok || subtle.ConstantTimeCompare(expected[:], presented[:]) != 1 {
-				http.Error(w, "unauthorized", http.StatusUnauthorized)
+	routes := http.NewServeMux()
+	routes.Handle("/mcp", sdk.NewStreamableHTTPHandler(func(*http.Request) *sdk.Server { return s.SDK }, nil))
+	if mediaExplorer {
+		routes.HandleFunc("GET /media", s.showMedia)
+		routes.HandleFunc("GET /media/download/{hash}", s.downloadMedia)
+	}
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		isMedia := mediaExplorer && (r.URL.Path == "/media" || strings.HasPrefix(r.URL.Path, "/media/"))
+		if isMedia && loopback {
+			host := r.Host
+			if name, _, err := net.SplitHostPort(host); err == nil {
+				host = name
+			}
+			if !loopbackHost(strings.Trim(host, "[]")) {
+				http.Error(w, "host denied", http.StatusForbidden)
 				return
 			}
 		}
@@ -294,17 +306,29 @@ func (s *Server) Run(ctx context.Context, address, tokenFile string, allowNetwor
 			http.Error(w, "origin denied", http.StatusForbidden)
 			return
 		}
-		if r.URL.Path != "/mcp" {
-			http.NotFound(w, r)
-			return
+		if requireToken {
+			value, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+			if isMedia && !ok {
+				var user string
+				user, value, ok = r.BasicAuth()
+				ok = ok && user == "igdm"
+			}
+			presented := sha256.Sum256([]byte(value))
+			if !ok || subtle.ConstantTimeCompare(expected[:], presented[:]) != 1 {
+				if isMedia {
+					w.Header().Set("WWW-Authenticate", `Basic realm="Instagram mirror media"`)
+				}
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
 		}
-		handler.ServeHTTP(w, r)
+		routes.ServeHTTP(w, r)
 	})
 	listener, err := net.Listen("tcp", address)
 	if err != nil {
 		return err
 	}
-	server := &http.Server{Handler: mcpHandler, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 90 * time.Second, MaxHeaderBytes: 16384}
+	server := &http.Server{Handler: handler, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 90 * time.Second, MaxHeaderBytes: 16384}
 	done := make(chan error, 1)
 	go func() { done <- server.Serve(listener) }()
 	select {

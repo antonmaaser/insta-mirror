@@ -58,7 +58,40 @@ func (s *Store) Media(ctx context.Context, account string, message int64) ([]Med
 }
 
 func (s *Store) MediaHash(ctx context.Context, account, hash string) (Media, error) {
-	return mediaScan(s.queryRowContext(ctx, `SELECT * FROM media_cache WHERE account_id=? AND hash=? AND status='available' LIMIT 1`, account, hash))
+	return mediaScan(s.queryRowContext(ctx, `SELECT c.* FROM media_cache c
+		JOIN messages m ON m.account_id=c.account_id AND m.id=c.message_id
+		WHERE c.account_id=? AND c.hash=? AND c.status='available'
+		AND m.placeholder=0 AND coalesce(m.deleted,0)=0 LIMIT 1`, account, hash))
+}
+
+type MediaListing struct {
+	Hash   string
+	MIME   string
+	Size   int64
+	Sender string
+}
+
+func (s *Store) ListMedia(ctx context.Context, account string, limit, offset int64) ([]MediaListing, error) {
+	rows, err := s.queryContext(ctx, `SELECT c.hash,c.mime,c.size,coalesce(nullif(u.name,''),nullif(u.username,''),'Unknown sender')
+		FROM media_cache c
+		JOIN messages m ON m.account_id=c.account_id AND m.id=c.message_id
+		LEFT JOIN users u ON u.account_id=m.account_id AND u.id=m.sender_id
+		WHERE c.account_id=? AND c.status='available' AND c.hash<>''
+		AND m.placeholder=0 AND coalesce(m.deleted,0)=0
+		ORDER BY c.message_id DESC,c.attachment DESC LIMIT ? OFFSET ?`, account, limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []MediaListing
+	for rows.Next() {
+		var item MediaListing
+		if err := rows.Scan(&item.Hash, &item.MIME, &item.Size, &item.Sender); err != nil {
+			return nil, err
+		}
+		items = append(items, item)
+	}
+	return items, rows.Err()
 }
 
 type MediaMessage struct {

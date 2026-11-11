@@ -181,7 +181,7 @@ func (c *Cache) Sync(ctx context.Context, account string) error {
 				m := existing[a.ref]
 				urlBytes, _ := json.Marshal(a.urls)
 				urlHash := store.Hash(urlBytes)
-				if !a.blocked && m.Status == "available" && c.exists(m.Hash) {
+				if !a.blocked && m.Status == "available" && c.HasFile(m.Hash) {
 					continue
 				}
 				if (!a.blocked || m.Status == "restricted") && m.URLHash == urlHash && (m.Status == "unavailable" || m.Status == "restricted" || m.Attempted > time.Now().Add(-time.Hour).UnixMilli()) {
@@ -234,8 +234,11 @@ func (c *Cache) Sync(ctx context.Context, account string) error {
 	}
 	return ctx.Err()
 }
-func (c *Cache) exists(hash string) bool {
+func (c *Cache) HasFile(hash string) bool {
 	if len(hash) != 64 {
+		return false
+	}
+	if _, err := hex.DecodeString(hash); err != nil {
 		return false
 	}
 	info, err := os.Lstat(filepath.Join(c.Dir, hash))
@@ -310,32 +313,33 @@ func (c *Cache) download(ctx context.Context, source string) (string, string, in
 	}
 	return contentHash, mime.String(), size, false, nil
 }
-func (c *Cache) Read(ctx context.Context, account, hash string, offset, length int64) ([]byte, store.Media, error) {
-	m := store.Media{}
-	if len(hash) != 64 {
-		return nil, m, errors.New("invalid media hash")
-	}
-	if _, err := hex.DecodeString(hash); err != nil {
-		return nil, m, errors.New("invalid media hash")
-	}
-	if offset < 0 || length < 1 || length > ChunkSize {
-		return nil, m, fmt.Errorf("media length must be 1 through %d bytes", ChunkSize)
+
+// OpenAvailable opens a cached file only if it belongs to an available
+// attachment for this account. The caller closes the file.
+func (c *Cache) OpenAvailable(ctx context.Context, account, hash string) (*os.File, store.Media, error) {
+	if !c.HasFile(hash) {
+		return nil, store.Media{}, os.ErrNotExist
 	}
 	m, err := c.DB.MediaHash(ctx, account, hash)
 	if err != nil {
-		return nil, m, errors.New("media not available for this account")
-	}
-	if !c.exists(hash) {
-		return nil, m, errors.New("cached media is missing")
-	}
-	if offset >= m.Size {
-		return nil, m, errors.New("media offset exceeds file size")
+		return nil, m, err
 	}
 	f, err := os.Open(filepath.Join(c.Dir, hash))
+	return f, m, err
+}
+
+func (c *Cache) Read(ctx context.Context, account, hash string, offset, length int64) ([]byte, store.Media, error) {
+	if offset < 0 || length < 1 || length > ChunkSize {
+		return nil, store.Media{}, fmt.Errorf("media length must be 1 through %d bytes", ChunkSize)
+	}
+	f, m, err := c.OpenAvailable(ctx, account, hash)
 	if err != nil {
 		return nil, m, err
 	}
 	defer f.Close()
+	if offset >= m.Size {
+		return nil, m, errors.New("media offset exceeds file size")
+	}
 	b, err := io.ReadAll(io.NewSectionReader(f, offset, length))
 	return b, m, err
 }
