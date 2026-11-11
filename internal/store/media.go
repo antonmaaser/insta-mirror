@@ -71,14 +71,14 @@ type MediaListing struct {
 	Sender string
 }
 
-func (s *Store) ListMedia(ctx context.Context, account string, limit, offset int64) ([]MediaListing, error) {
+func (s *Store) ListMedia(ctx context.Context, account string) ([]MediaListing, error) {
 	rows, err := s.queryContext(ctx, `SELECT c.hash,c.mime,c.size,coalesce(nullif(u.name,''),nullif(u.username,''),'Unknown sender')
 		FROM media_cache c
 		JOIN messages m ON m.account_id=c.account_id AND m.id=c.message_id
 		LEFT JOIN users u ON u.account_id=m.account_id AND u.id=m.sender_id
 		WHERE c.account_id=? AND c.status='available' AND c.hash<>''
 		AND m.placeholder=0 AND coalesce(m.deleted,0)=0
-		ORDER BY c.message_id DESC,c.attachment DESC LIMIT ? OFFSET ?`, account, limit, offset)
+		ORDER BY c.message_id DESC,c.attachment DESC`, account)
 	if err != nil {
 		return nil, err
 	}

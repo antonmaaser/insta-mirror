@@ -289,6 +289,11 @@ func (s *Server) Run(ctx context.Context, address, tokenFile string, allowNetwor
 	if mediaExplorer {
 		routes.HandleFunc("GET /media", s.showMedia)
 		routes.HandleFunc("GET /media/download/{hash}", s.downloadMedia)
+		routes.HandleFunc("GET /media/sort.js", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
+			w.Header().Set("X-Content-Type-Options", "nosniff")
+			_, _ = w.Write(mediaSortJS)
+		})
 	}
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		isMedia := mediaExplorer && (r.URL.Path == "/media" || strings.HasPrefix(r.URL.Path, "/media/"))

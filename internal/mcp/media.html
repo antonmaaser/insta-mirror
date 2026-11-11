@@ -4,6 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Media · Instagram mirror</title>
+  <script src="/media/sort.js" defer></script>
   <style>
     :root { color-scheme: light dark; font: 16px/1.5 Inter, system-ui, sans-serif; }
     body { max-width: 52rem; margin: clamp(1rem, 5vw, 4rem) auto; padding: 0 1rem; }
@@ -12,41 +13,42 @@
     th, td { text-align: left; padding: .65rem .45rem; border-bottom: 1px solid GrayText; overflow-wrap: anywhere; }
     .size { text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
     a { text-underline-offset: .18em; }
-    nav { display: flex; gap: 1.25rem; margin-top: 1rem; }
+    th button { border: 0; background: none; color: inherit; font: inherit; padding: 0; cursor: pointer; }
+    th[aria-sort="ascending"] button::after { content: " ↑"; }
+    th[aria-sort="descending"] button::after { content: " ↓"; }
+    .download { display: block; font-size: .875rem; }
   </style>
 </head>
 <body>
   <main>
     <h1>Media</h1>
-    {{if .Items}}
+    {{if .}}
     <table>
       <thead>
         <tr>
-          <th scope="col">Type</th>
-          <th scope="col" class="size">Size</th>
-          <th scope="col">Sender</th>
-          <th scope="col">File</th>
+          <th scope="col"><button type="button">Type</button></th>
+          <th scope="col" class="size" data-numeric><button type="button">Size</button></th>
+          <th scope="col"><button type="button">Sender</button></th>
+          <th scope="col"><button type="button">File</button></th>
         </tr>
       </thead>
       <tbody>
-        {{range .Items}}
+        {{range .}}
+        {{$name := filename .MIME .Hash}}
         <tr>
           <td>{{.MIME}}</td>
-          <td class="size">{{size .Size}}</td>
+          <td class="size" data-sort="{{.Size}}">{{size .Size}}</td>
           <td>{{.Sender}}</td>
-          <td><a href="/media/download/{{.Hash}}" aria-label="Download {{.MIME}} from {{.Sender}}">Download</a></td>
+          <td data-sort="{{$name}}">
+            <a href="/media/download/{{.Hash}}?view=1" target="_blank" rel="noopener" aria-label="Open {{$name}} in a new tab">{{$name}}</a>
+            <a class="download" href="/media/download/{{.Hash}}" aria-label="Download {{$name}}">Download</a>
+          </td>
         </tr>
         {{end}}
       </tbody>
     </table>
     {{else}}
-    <p>No cached media on this page.</p>
-    {{end}}
-    {{if or .Previous .Next}}
-    <nav aria-label="Media pages">
-      {{if .Previous}}<a href="/media?page={{.Previous}}" rel="prev">Previous</a>{{end}}
-      {{if .Next}}<a href="/media?page={{.Next}}" rel="next">Next</a>{{end}}
-    </nav>
+    <p>No cached media.</p>
     {{end}}
   </main>
 </body>

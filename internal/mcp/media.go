@@ -9,18 +9,20 @@ import (
 	"mime"
 	"net/http"
 	"os"
-	"strconv"
+	"strings"
 	"time"
 
 	"go.mau.fi/mautrix-meta/internal/store"
 )
 
-const mediaPageSize int64 = 50
-
 //go:embed media.html
 var mediaHTML string
 
+//go:embed media-sort.js
+var mediaSortJS []byte
+
 var mediaTemplate = template.Must(template.New("media").Funcs(template.FuncMap{
+	"filename": mediaFilename,
 	"size": func(size int64) string {
 		value := float64(size)
 		for _, unit := range []string{"KiB", "MiB", "GiB"} {
@@ -41,44 +43,27 @@ func (s *Server) showMedia(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "media cache unavailable", http.StatusServiceUnavailable)
 		return
 	}
-	page := int64(1)
-	if raw := r.URL.Query().Get("page"); raw != "" {
-		var err error
-		page, err = strconv.ParseInt(raw, 10, 32)
-		if err != nil || page < 1 {
-			http.Error(w, "invalid page", http.StatusBadRequest)
-			return
-		}
-	}
-	items, err := s.DB.ListMedia(r.Context(), s.Account, mediaPageSize+1, (page-1)*mediaPageSize)
+	items, err := s.DB.ListMedia(r.Context(), s.Account)
 	if err != nil {
 		http.Error(w, "could not list cached media", http.StatusInternalServerError)
 		return
 	}
-	view := struct {
-		Items    []store.MediaListing
-		Previous int64
-		Next     int64
-	}{Previous: page - 1}
-	if int64(len(items)) > mediaPageSize {
-		view.Next = page + 1
-		items = items[:mediaPageSize]
-	}
+	available := items[:0]
 	for _, item := range items {
 		if s.Cache.HasFile(item.Hash) {
-			view.Items = append(view.Items, item)
+			available = append(available, item)
 		}
 	}
 
 	var out bytes.Buffer
-	if err := mediaTemplate.Execute(&out, view); err != nil {
+	if err := mediaTemplate.Execute(&out, available); err != nil {
 		http.Error(w, "could not display cached media", http.StatusInternalServerError)
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
-	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'")
 	_, _ = w.Write(out.Bytes())
 }
 
@@ -98,17 +83,40 @@ func (s *Server) downloadMedia(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
-	name := "instagram-" + item.Hash[:12]
-	contentType, _, err := mime.ParseMediaType(item.MIME)
-	if err != nil {
-		contentType = "application/octet-stream"
-	}
-	if extensions, _ := mime.ExtensionsByType(contentType); len(extensions) > 0 {
-		name += extensions[0]
+	name := mediaFilename(item.MIME, item.Hash)
+	contentType := mediaContentType(item.MIME)
+	disposition := "attachment"
+	if r.URL.Query().Get("view") == "1" && inlineMediaType(contentType) {
+		disposition = "inline"
 	}
 	w.Header().Set("Content-Type", contentType)
-	w.Header().Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": name}))
+	w.Header().Set("Content-Disposition", mime.FormatMediaType(disposition, map[string]string{"filename": name}))
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	http.ServeContent(w, r, name, time.Time{}, file)
+}
+
+func mediaContentType(value string) string {
+	contentType, _, err := mime.ParseMediaType(value)
+	if err != nil {
+		return "application/octet-stream"
+	}
+	return contentType
+}
+
+func mediaFilename(contentType, hash string) string {
+	name := "instagram-" + hash[:12]
+	if extensions, _ := mime.ExtensionsByType(mediaContentType(contentType)); len(extensions) > 0 {
+		name += extensions[0]
+	}
+	return name
+}
+
+func inlineMediaType(contentType string) bool {
+	switch contentType {
+	case "image/apng", "image/avif", "image/bmp", "image/gif", "image/jpeg", "image/png", "image/webp":
+		return true
+	default:
+		return strings.HasPrefix(contentType, "audio/") || strings.HasPrefix(contentType, "video/")
+	}
 }
