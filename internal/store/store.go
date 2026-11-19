@@ -35,7 +35,7 @@ type State struct {
 	Gaps        []string `json:"gaps,omitempty"`
 }
 
-const schemaVersion = 5
+const schemaVersion = 6
 
 func Open(path string) (*Store, error) {
 	// Reject incompatible files before permissions, journal mode, or schema change.

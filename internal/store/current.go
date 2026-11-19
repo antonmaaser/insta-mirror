@@ -10,70 +10,271 @@ import (
 	"strings"
 )
 
-const currentSchema = `
+const currentSchema = `CREATE TABLE accounts (
+    account_id      TEXT PRIMARY KEY,
+    self_user_id    INTEGER,
+    created_at_ms   INTEGER NOT NULL,
+    updated_at_ms   INTEGER NOT NULL,
+    FOREIGN KEY(account_id,self_user_id) REFERENCES users(account_id,user_id)
+) WITHOUT ROWID;
+
+CREATE TABLE media_assets (
+    account_id      TEXT NOT NULL,
+    asset_id        INTEGER PRIMARY KEY,
+    canonical_key   TEXT NOT NULL,          -- Priority: 'fbid:<id>' | 'ig_cache:<key>' | 'path_sha256:<hex>'
+    asset_kind      TEXT NOT NULL,          -- 'AVATAR' | 'IMAGE' | 'VIDEO' | 'AUDIO' | 'XMA_PREVIEW'
+    download_status TEXT NOT NULL DEFAULT 'pending', -- 'pending' | 'available' | 'unavailable'
+    content_sha256  TEXT,
+    mime_type       TEXT,
+    byte_size       INTEGER,
+    attempts        INTEGER NOT NULL DEFAULT 0,
+    last_attempt_ms INTEGER,
+    last_error      TEXT,
+    UNIQUE(account_id, canonical_key),
+    UNIQUE(account_id, asset_id),
+    FOREIGN KEY(account_id) REFERENCES accounts(account_id)
+);
+
+CREATE INDEX idx_media_assets_content_hash
+    ON media_assets(account_id, content_sha256) WHERE content_sha256 IS NOT NULL;
+
+CREATE INDEX idx_media_assets_pending
+    ON media_assets(account_id, download_status, attempts) WHERE download_status = 'pending';
+
+CREATE TABLE media_asset_urls (
+    account_id      TEXT NOT NULL,
+    asset_id        INTEGER NOT NULL,
+    url_role        TEXT NOT NULL DEFAULT 'primary', -- 'primary' | 'fallback'
+    url             TEXT NOT NULL,
+    expires_at_ms   INTEGER,
+    observed_at_ms  INTEGER NOT NULL,
+    PRIMARY KEY (account_id, asset_id, url_role),
+    FOREIGN KEY (account_id, asset_id) REFERENCES media_assets(account_id, asset_id) ON DELETE CASCADE
+) WITHOUT ROWID;
+
 CREATE TABLE users (
- id INTEGER PRIMARY KEY, account_id TEXT NOT NULL, username TEXT, name TEXT, avatar_url TEXT,
- verified INTEGER, restricted INTEGER, blocking INTEGER, following INTEGER, followed_by INTEGER,
- ai_agent_type TEXT, latest_reel INTEGER, latest_besties_reel INTEGER, reel_seen_at INTEGER,
- UNIQUE(account_id,id)
+    account_id          TEXT NOT NULL,
+    user_id             INTEGER PRIMARY KEY,
+    username            TEXT,
+    full_name           TEXT,
+    avatar_asset_id     INTEGER,
+    verified            INTEGER NOT NULL DEFAULT 0,
+    restricted          INTEGER NOT NULL DEFAULT 0,
+    blocking            INTEGER NOT NULL DEFAULT 0,
+    following           INTEGER NOT NULL DEFAULT 0,
+    followed_by         INTEGER NOT NULL DEFAULT 0,
+    ai_agent_type       TEXT,
+    latest_reel_at      INTEGER,
+    latest_besties_at   INTEGER,
+    reel_seen_at        INTEGER,
+    source_tier         INTEGER NOT NULL DEFAULT 1, -- 1=stub, 2=delta/snippet, 3=slide, 4=graphql_full
+    fingerprint         BLOB NOT NULL,
+    updated_at_ms       INTEGER NOT NULL,
+    UNIQUE(account_id, user_id),
+    FOREIGN KEY (account_id, avatar_asset_id) REFERENCES media_assets(account_id, asset_id),
+    FOREIGN KEY(account_id) REFERENCES accounts(account_id)
 );
+
+CREATE TABLE user_identities (
+    account_id      TEXT NOT NULL,
+    namespace       TEXT NOT NULL,          -- 'igid' | 'messaging_fbid' | 'fbid_v2'
+    remote_id       TEXT NOT NULL,
+    user_id         INTEGER NOT NULL,
+    PRIMARY KEY (account_id, namespace, remote_id),
+    FOREIGN KEY (account_id, user_id) REFERENCES users(account_id, user_id) ON DELETE CASCADE
+) WITHOUT ROWID;
+
+CREATE INDEX idx_user_identities_user ON user_identities(account_id, user_id);
+
 CREATE TABLE threads (
- id INTEGER PRIMARY KEY, account_id TEXT NOT NULL, title TEXT, image_url TEXT, folder TEXT,
- activity_at INTEGER, subtype TEXT, is_group INTEGER, muted INTEGER, pinned INTEGER,
- unread INTEGER, read_at INTEGER, input_mode INTEGER, reachability TEXT, deleted INTEGER,
- UNIQUE(account_id,id)
+    account_id      TEXT NOT NULL,
+    thread_id       INTEGER PRIMARY KEY,
+    title           TEXT,
+    image_asset_id  INTEGER,
+    folder          TEXT NOT NULL DEFAULT 'INBOX',
+    subtype         TEXT,
+    is_group        INTEGER NOT NULL DEFAULT 0,
+    muted           INTEGER NOT NULL DEFAULT 0,
+    pinned          INTEGER NOT NULL DEFAULT 0,
+    unread          INTEGER NOT NULL DEFAULT 0,
+    read_at_ms      INTEGER,
+    activity_at_ms  INTEGER,
+    input_mode      INTEGER,
+    reachability    TEXT,
+    capabilities    TEXT,
+    deleted         INTEGER NOT NULL DEFAULT 0,
+    source_tier     INTEGER NOT NULL DEFAULT 1,
+    fingerprint     BLOB NOT NULL,
+    updated_at_ms   INTEGER NOT NULL,
+    UNIQUE(account_id, thread_id),
+    FOREIGN KEY (account_id, image_asset_id) REFERENCES media_assets(account_id, asset_id),
+    FOREIGN KEY(account_id) REFERENCES accounts(account_id)
 );
-CREATE TABLE messages (
- id INTEGER PRIMARY KEY, account_id TEXT NOT NULL, thread_id INTEGER, sender_id INTEGER, reply_id INTEGER,
- sent_at INTEGER, body TEXT, kind TEXT, snippet TEXT, attachments TEXT, edits TEXT,
- edited_at INTEGER, expires_at INTEGER, view_expires_at INTEGER, forwarded INTEGER,
- pinned INTEGER, reported INTEGER, ai_generated INTEGER, deleted INTEGER, placeholder INTEGER NOT NULL DEFAULT 1,
- reactions_known INTEGER, mentions_known INTEGER,
- CHECK(placeholder=1 OR (thread_id IS NOT NULL AND sent_at IS NOT NULL)),
- UNIQUE(account_id,id),
- FOREIGN KEY(account_id,thread_id) REFERENCES threads(account_id,id),
- FOREIGN KEY(account_id,sender_id) REFERENCES users(account_id,id),
- FOREIGN KEY(account_id,reply_id) REFERENCES messages(account_id,id)
-);
-CREATE INDEX messages_history ON messages(thread_id,sent_at,id) WHERE placeholder=0;
-CREATE INDEX threads_activity ON threads(account_id,activity_at,id);
-CREATE TABLE source_ids (
- account_id TEXT NOT NULL, namespace TEXT NOT NULL, scope TEXT NOT NULL DEFAULT '', remote_id TEXT NOT NULL,
- user_id INTEGER, thread_id INTEGER, message_id INTEGER,
- PRIMARY KEY(account_id,namespace,scope,remote_id),
- CHECK((user_id IS NOT NULL)+(thread_id IS NOT NULL)+(message_id IS NOT NULL)=1),
- FOREIGN KEY(account_id,user_id) REFERENCES users(account_id,id),
- FOREIGN KEY(account_id,thread_id) REFERENCES threads(account_id,id),
- FOREIGN KEY(account_id,message_id) REFERENCES messages(account_id,id)
+
+CREATE INDEX idx_threads_inbox
+    ON threads(account_id, folder, deleted, activity_at_ms DESC, thread_id);
+
+CREATE TABLE thread_identities (
+    account_id      TEXT NOT NULL,
+    namespace       TEXT NOT NULL,
+    scope TEXT NOT NULL DEFAULT '',
+    remote_id       TEXT NOT NULL,
+    thread_id       INTEGER NOT NULL,
+    PRIMARY KEY (account_id, namespace, scope, remote_id),
+    FOREIGN KEY (account_id, thread_id) REFERENCES threads(account_id, thread_id) ON DELETE CASCADE
 ) WITHOUT ROWID;
-CREATE INDEX ids_thread ON source_ids(account_id,thread_id,namespace) WHERE thread_id IS NOT NULL;
+
+CREATE INDEX idx_thread_identities_thread ON thread_identities(account_id, thread_id);
+
 CREATE TABLE thread_members (
- thread_id INTEGER NOT NULL REFERENCES threads(id), user_id INTEGER NOT NULL REFERENCES users(id),
- member INTEGER, nickname TEXT, admin INTEGER, read_at INTEGER,
- PRIMARY KEY(thread_id,user_id)
+    account_id      TEXT NOT NULL,
+    thread_id       INTEGER NOT NULL,
+    user_id         INTEGER NOT NULL,
+    is_active       INTEGER NOT NULL DEFAULT 1,
+    is_admin        INTEGER NOT NULL DEFAULT 0,
+    nickname        TEXT,
+    read_at_ms      INTEGER,
+    fingerprint     BLOB NOT NULL,
+    PRIMARY KEY (account_id, thread_id, user_id),
+    FOREIGN KEY (account_id, thread_id) REFERENCES threads(account_id, thread_id) ON DELETE CASCADE,
+    FOREIGN KEY (account_id, user_id) REFERENCES users(account_id, user_id)
 ) WITHOUT ROWID;
+
+CREATE TABLE messages (
+    account_id          TEXT NOT NULL,
+    message_id          INTEGER PRIMARY KEY,
+    thread_id           INTEGER,
+    sender_id           INTEGER,
+    reply_to_message_id INTEGER,
+    sent_at_ms          INTEGER,
+    edited_at_ms        INTEGER,
+    kind                TEXT,
+    body                TEXT,
+    snippet             TEXT,
+    expires_at_ms       INTEGER,
+    view_expires_at_ms  INTEGER,
+    forwarded           INTEGER NOT NULL DEFAULT 0,
+    pinned              INTEGER NOT NULL DEFAULT 0,
+    reported            INTEGER NOT NULL DEFAULT 0,
+    ai_generated        INTEGER NOT NULL DEFAULT 0,
+    bot_response_id     TEXT,
+    deleted             INTEGER NOT NULL DEFAULT 0,
+    tombstone_reason    TEXT,
+    is_placeholder      INTEGER NOT NULL DEFAULT 1,
+    source_tier         INTEGER NOT NULL DEFAULT 1,
+    fingerprint         BLOB NOT NULL,
+    updated_at_ms       INTEGER NOT NULL,
+    CHECK (is_placeholder = 1 OR (thread_id IS NOT NULL AND sent_at_ms IS NOT NULL)),
+    UNIQUE(account_id, message_id),
+    FOREIGN KEY (account_id, thread_id) REFERENCES threads(account_id, thread_id),
+    FOREIGN KEY (account_id, sender_id) REFERENCES users(account_id, user_id),
+    FOREIGN KEY (account_id, reply_to_message_id) REFERENCES messages(account_id, message_id),
+    FOREIGN KEY(account_id) REFERENCES accounts(account_id)
+);
+
+CREATE INDEX idx_messages_thread_history
+    ON messages(account_id, thread_id, sent_at_ms DESC, message_id) WHERE is_placeholder = 0;
+
+CREATE TABLE message_identities (
+    account_id      TEXT NOT NULL,
+    namespace       TEXT NOT NULL,          -- 'mid' | 'otid' | 'item_id'
+    remote_id       TEXT NOT NULL,
+    message_id      INTEGER NOT NULL,
+    PRIMARY KEY (account_id, namespace, remote_id),
+    FOREIGN KEY (account_id, message_id) REFERENCES messages(account_id, message_id) ON DELETE CASCADE
+) WITHOUT ROWID;
+
+CREATE INDEX idx_message_identities_msg ON message_identities(account_id, message_id);
+
+CREATE TABLE message_attachments (
+    account_id          TEXT NOT NULL,
+    message_id          INTEGER NOT NULL,
+    ordinal             INTEGER NOT NULL,
+    asset_id            INTEGER NOT NULL,
+    attachment_kind     TEXT NOT NULL,
+    remote_entity_id    TEXT,
+    remote_entity_type  INTEGER,
+    title               TEXT,
+    subtitle            TEXT,
+    target_url          TEXT,
+    PRIMARY KEY (account_id, message_id, ordinal),
+    FOREIGN KEY (account_id, message_id) REFERENCES messages(account_id, message_id) ON DELETE CASCADE,
+    FOREIGN KEY (account_id, asset_id) REFERENCES media_assets(account_id, asset_id)
+) WITHOUT ROWID;
+
+CREATE TABLE message_edits (
+    account_id      TEXT NOT NULL,
+    message_id      INTEGER NOT NULL,
+    edit_index      INTEGER NOT NULL,
+    edited_at_ms    INTEGER NOT NULL,
+    previous_body   TEXT NOT NULL,
+    PRIMARY KEY (account_id, message_id, edit_index),
+    FOREIGN KEY (account_id, message_id) REFERENCES messages(account_id, message_id) ON DELETE CASCADE
+) WITHOUT ROWID;
+
 CREATE TABLE message_reactions (
- message_id INTEGER NOT NULL REFERENCES messages(id), user_id INTEGER NOT NULL REFERENCES users(id),
- reaction TEXT NOT NULL, reacted_at INTEGER, log_message_id INTEGER REFERENCES messages(id),
- PRIMARY KEY(message_id,user_id)
+    account_id      TEXT NOT NULL,
+    message_id      INTEGER NOT NULL,
+    user_id         INTEGER NOT NULL,
+    reaction        TEXT NOT NULL,
+    reacted_at_ms   INTEGER,
+    log_message_id  INTEGER,
+    PRIMARY KEY (account_id, message_id, user_id),
+    FOREIGN KEY (account_id, message_id) REFERENCES messages(account_id, message_id) ON DELETE CASCADE,
+    FOREIGN KEY (account_id, user_id) REFERENCES users(account_id, user_id),
+    FOREIGN KEY (account_id, log_message_id) REFERENCES messages(account_id, message_id)
 ) WITHOUT ROWID;
+
 CREATE TABLE message_mentions (
- message_id INTEGER NOT NULL REFERENCES messages(id), offset INTEGER NOT NULL, length INTEGER NOT NULL,
- kind TEXT NOT NULL, user_id INTEGER REFERENCES users(id), thread_id INTEGER REFERENCES threads(id),
- PRIMARY KEY(message_id,offset,length,kind)
+    account_id          TEXT NOT NULL,
+    message_id          INTEGER NOT NULL,
+    offset              INTEGER NOT NULL,
+    length              INTEGER NOT NULL,
+    kind                TEXT NOT NULL,
+    mentioned_user_id   INTEGER,
+    mentioned_thread_id INTEGER,
+    PRIMARY KEY (account_id, message_id, offset, length, kind),
+    FOREIGN KEY (account_id, message_id) REFERENCES messages(account_id, message_id) ON DELETE CASCADE,
+    FOREIGN KEY (account_id, mentioned_user_id) REFERENCES users(account_id, user_id),
+    FOREIGN KEY (account_id, mentioned_thread_id) REFERENCES threads(account_id, thread_id)
 ) WITHOUT ROWID;
-CREATE TABLE sync_state (
- account_id TEXT NOT NULL, scope TEXT NOT NULL, scope_id TEXT NOT NULL, state TEXT NOT NULL CHECK(json_valid(state)),
+
+CREATE TABLE sync_cursors (
+    account_id          TEXT NOT NULL,
+    scope               TEXT NOT NULL,      -- 'inbox' | 'head' | 'backfill'
+    scope_id            TEXT NOT NULL,
+    revision            INTEGER NOT NULL DEFAULT 0,
+    target TEXT, candidate TEXT, generation INTEGER NOT NULL DEFAULT 0,
+    cursor              TEXT,
+    anchor_remote_id    TEXT,
+    page_fingerprint    BLOB,
+    complete            INTEGER NOT NULL DEFAULT 0,
+    last_success_ms     INTEGER NOT NULL,
+    PRIMARY KEY (account_id, scope, scope_id),
+    FOREIGN KEY(account_id) REFERENCES accounts(account_id)
+) WITHOUT ROWID;
+
+
+CREATE TABLE operational_state (
+ account_id TEXT NOT NULL REFERENCES accounts(account_id), scope TEXT NOT NULL, scope_id TEXT NOT NULL,
+ revision INTEGER NOT NULL DEFAULT 0, anchor TEXT, target TEXT, candidate TEXT, generation INTEGER NOT NULL DEFAULT 0,
+ page_hash TEXT, cursor TEXT, complete INTEGER NOT NULL DEFAULT 0, seq_id INTEGER NOT NULL DEFAULT 0,
+ timestamp_ms INTEGER NOT NULL DEFAULT 0, last_success_ms INTEGER NOT NULL DEFAULT 0, error TEXT NOT NULL DEFAULT '',
+ connected INTEGER, observed_at_ms INTEGER, subscribed_seq_id INTEGER, latest_seq_id INTEGER, failures INTEGER,
+ session_saved INTEGER, last_validated_ms INTEGER, established_at_ms INTEGER, coverage TEXT,
  PRIMARY KEY(account_id,scope,scope_id)
 ) WITHOUT ROWID;
-CREATE TABLE media_cache (
- account_id TEXT NOT NULL, message_id INTEGER NOT NULL, attachment TEXT NOT NULL, url_hash TEXT NOT NULL,
- status TEXT NOT NULL, hash TEXT NOT NULL, mime TEXT NOT NULL, size INTEGER NOT NULL,
- attempted INTEGER NOT NULL, attempts INTEGER NOT NULL, error TEXT NOT NULL,
- PRIMARY KEY(account_id,message_id,attachment),
- FOREIGN KEY(account_id,message_id) REFERENCES messages(account_id,id) ON DELETE CASCADE
+CREATE TABLE operational_gaps (
+ account_id TEXT NOT NULL, scope TEXT NOT NULL, scope_id TEXT NOT NULL, ordinal INTEGER NOT NULL, detail TEXT NOT NULL,
+ PRIMARY KEY(account_id,scope,scope_id,ordinal),
+ FOREIGN KEY(account_id,scope,scope_id) REFERENCES operational_state(account_id,scope,scope_id) ON DELETE CASCADE
 ) WITHOUT ROWID;
-CREATE INDEX media_hash ON media_cache(account_id,hash) WHERE hash!='';
+CREATE TABLE thread_pinned_messages (
+ account_id TEXT NOT NULL, thread_id INTEGER NOT NULL, message_id INTEGER NOT NULL,
+ PRIMARY KEY(account_id,thread_id,message_id),
+ FOREIGN KEY(account_id,thread_id) REFERENCES threads(account_id,thread_id) ON DELETE CASCADE,
+ FOREIGN KEY(account_id,message_id) REFERENCES messages(account_id,message_id)
+) WITHOUT ROWID;
 `
 
 type Alias struct {
