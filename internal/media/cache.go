@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -29,11 +28,6 @@ type Cache struct {
 	DB   *store.Store
 	Dir  string
 	HTTP *http.Client
-}
-type attachment struct {
-	ref     string
-	urls    []string
-	blocked bool
 }
 
 func New(db *store.Store, dir string) (*Cache, error) {
@@ -102,8 +96,8 @@ func DescribeAttachments(msg slidetypes.Message, expiring bool) []store.Attachme
 			}
 		}
 		if len(nonempty) > 0 {
-			if ref == "" || ref == "attachment_fbid:" {
-				ref = "url_sha256:" + store.Hash([]byte(nonempty[0]))
+			if ref == "" || ref == "fbid:" {
+				ref, _ = store.MediaKey("", nonempty)
 			}
 			out = append(out, store.Attachment{Key: ref, URLs: nonempty, Kind: msg.ContentType})
 		}
@@ -111,7 +105,7 @@ func DescribeAttachments(msg slidetypes.Message, expiring bool) []store.Attachme
 	ordinary := func(items []*slidetypes.Attachment) {
 		for _, a := range items {
 			if a != nil {
-				add("attachment_fbid:"+a.AttachmentFBID, a.AttachmentCDNURL, a.AttachmentCDNFallbackURL)
+				add("fbid:"+a.AttachmentFBID, a.AttachmentCDNURL, a.AttachmentCDNFallbackURL)
 			}
 		}
 	}
@@ -125,7 +119,7 @@ func DescribeAttachments(msg slidetypes.Message, expiring bool) []store.Attachme
 	case *slidetypes.MessageContentAudio:
 		for _, a := range content.AudioAttachments {
 			if a != nil {
-				add("attachment_fbid:"+a.AttachmentFBID, a.AttachmentCDNURL)
+				add("fbid:"+a.AttachmentFBID, a.AttachmentCDNURL)
 			}
 		}
 	case *slidetypes.MessageContentAnimatedMedia:
@@ -160,76 +154,52 @@ func DescribeAttachments(msg slidetypes.Message, expiring bool) []store.Attachme
 func (c *Cache) Sync(ctx context.Context, account string) error {
 	var after int64
 	for ctx.Err() == nil {
-		records, err := c.DB.MessageBatch(ctx, account, after)
+		assets, err := c.DB.PendingMedia(ctx, account, after)
 		if err != nil {
 			return err
 		}
-		if len(records) == 0 {
+		if len(assets) == 0 {
 			return nil
 		}
-		for _, r := range records {
-			prior, err := c.DB.Media(ctx, account, r.ID)
-			if err != nil {
+		for _, m := range assets {
+			m.Attempts++
+			m.Attempted = time.Now().UnixMilli()
+			m.Status = "pending"
+			m.Error = "media retrieval failed; retry pending"
+			for attempt := 0; attempt < 3; attempt++ {
+				permanent := true
+				for _, raw := range m.URLs {
+					hash, mime, size, terminal, err := c.download(ctx, raw)
+					if err == nil {
+						m.Status = "available"
+						m.Hash = hash
+						m.MIME = mime
+						m.Size = size
+						m.Error = ""
+						break
+					}
+					permanent = permanent && terminal
+				}
+				if m.Status == "available" {
+					break
+				}
+				if permanent {
+					m.Status = "unavailable"
+					m.Error = "source media is inaccessible, unsupported, or exceeds the cache limit"
+					break
+				}
+				timer := time.NewTimer(time.Duration(1<<attempt) * time.Second)
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					return ctx.Err()
+				case <-timer.C:
+				}
+			}
+			if err = c.DB.SaveMedia(ctx, m); err != nil {
 				return err
 			}
-			existing := map[string]store.Media{}
-			for _, m := range prior {
-				existing[m.Attachment] = m
-			}
-			for _, desc := range r.Attachments {
-				a := attachment{ref: desc.Key, urls: desc.URLs, blocked: desc.Restricted}
-				m := existing[a.ref]
-				urlBytes, _ := json.Marshal(a.urls)
-				urlHash := store.Hash(urlBytes)
-				if !a.blocked && m.Status == "available" && c.HasFile(m.Hash) {
-					continue
-				}
-				if (!a.blocked || m.Status == "restricted") && m.URLHash == urlHash && (m.Status == "unavailable" || m.Status == "restricted" || m.Attempted > time.Now().Add(-time.Hour).UnixMilli()) {
-					continue
-				}
-				m = store.Media{Account: account, MessageID: r.ID, Attachment: a.ref, URLHash: urlHash, Attempted: time.Now().UnixMilli(), Attempts: m.Attempts + 1}
-				if a.blocked {
-					m.Status = "restricted"
-					m.Error = "ephemeral or expired media is not acquired"
-				} else {
-					m.Status = "failed"
-					m.Error = "media retrieval failed; retry pending"
-					for attempt := 0; attempt < 3; attempt++ {
-						terminal := false
-						for _, sourceURL := range a.urls {
-							hash, mime, size, permanent, err := c.download(ctx, sourceURL)
-							if err == nil {
-								m.Status = "available"
-								m.Hash = hash
-								m.MIME = mime
-								m.Size = size
-								m.Error = ""
-								break
-							}
-							terminal = permanent
-						}
-						if m.Status == "available" {
-							break
-						}
-						if terminal {
-							m.Status = "unavailable"
-							m.Error = "source media is inaccessible, unsupported, or exceeds the cache limit"
-							break
-						}
-						t := time.NewTimer(time.Duration(1<<attempt) * time.Second)
-						select {
-						case <-ctx.Done():
-							t.Stop()
-							return ctx.Err()
-						case <-t.C:
-						}
-					}
-				}
-				if err = c.DB.SaveMedia(ctx, m, r.StoredAttachments); err != nil {
-					return err
-				}
-			}
-			after = r.ID
+			after = m.AssetID
 		}
 	}
 	return ctx.Err()
