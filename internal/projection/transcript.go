@@ -79,13 +79,29 @@ func WriteTranscript(ctx context.Context, db *store.Store, chat store.Record, w 
 			}
 			fmt.Fprintln(&text)
 		}
+		if m.TombstoneReason != nil {
+			fmt.Fprintf(&text, "Tombstone reason: %q\n", *m.TombstoneReason)
+		}
+		for _, edit := range m.Edits {
+			fmt.Fprintf(&text, "Previous body (%d): %q\n", edit.At, transcriptText(edit.Body))
+		}
+		for _, mention := range m.Mentions {
+			fmt.Fprintf(&text, "Mention: offset=%d length=%d kind=%q", mention.Offset, mention.Length, mention.Kind)
+			if mention.UserID != nil {
+				fmt.Fprintf(&text, " user=%d", *mention.UserID)
+			}
+			if mention.ThreadID != nil {
+				fmt.Fprintf(&text, " thread=%d", *mention.ThreadID)
+			}
+			fmt.Fprintln(&text)
+		}
 		for _, reaction := range m.Reactions {
 			fmt.Fprintf(&text, "Reaction: %q by user %d\n", reaction.Value, reaction.UserID)
 		}
 		for _, a := range m.Attachments {
 			status := "not cached"
 			if a.Restricted {
-				status = "restricted"
+				status = "unavailable"
 			}
 			fmt.Fprintf(&text, "Attachment: %q (%s)\n", a.Kind, status)
 		}

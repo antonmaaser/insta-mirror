@@ -140,7 +140,7 @@ func (b *ingestion) scan(kind string, id int64, columns []string, dest ...any) e
 	}
 	return nil
 }
-func (b *ingestion) memo(kind string, id int64, o sourceObject) bool {
+func (b *ingestion) memo(kind string, id int64, o sourceObject, extra ...any) bool {
 	if b.seenEntities == nil {
 		b.seenEntities = map[entityKey]map[string]bool{}
 	}
@@ -148,7 +148,10 @@ func (b *ingestion) memo(kind string, id int64, o sourceObject) bool {
 	if b.seenEntities[key] == nil {
 		b.seenEntities[key] = map[string]bool{}
 	}
-	fingerprint := fmt.Sprintf("%d:%t:%s", b.incomingTier(), b.fill, store.Hash([]byte(store.JSONValue(o))))
+	fingerprint := fmt.Sprintf("%d:%t:%s", b.incomingTier(), b.fill, store.Hash([]byte(store.JSONValue(struct {
+		Source  sourceObject
+		Context []any
+	}{o, extra}))))
 	if b.seenEntities[key][fingerprint] {
 		return true
 	}
@@ -175,7 +178,7 @@ func (b *ingestion) patchTier(kind string, id int64, values map[string]any, fill
 			continue
 		}
 		if key == "attachments" || key == "edits" {
-			if fill && tier <= v.tier && b.event == 0 {
+			if fill && !v.created && v.originalTier >= 3 && b.event == 0 {
 				continue
 			}
 			if key == "attachments" {
@@ -184,10 +187,6 @@ func (b *ingestion) patchTier(kind string, id int64, values map[string]any, fill
 					switch a := value.(type) {
 					case []store.Attachment:
 						items = a
-					case string:
-						if err = json.Unmarshal([]byte(a), &items); err != nil {
-							return nil, err
-						}
 					default:
 						return nil, errors.New("invalid attachments")
 					}
@@ -199,10 +198,6 @@ func (b *ingestion) patchTier(kind string, id int64, values map[string]any, fill
 					switch a := value.(type) {
 					case []store.Edit:
 						items = a
-					case string:
-						if err = json.Unmarshal([]byte(a), &items); err != nil {
-							return nil, err
-						}
 					default:
 						return nil, errors.New("invalid edits")
 					}
@@ -236,7 +231,7 @@ func (b *ingestion) patchTier(kind string, id int64, values map[string]any, fill
 		if value == nil && tier > v.tier {
 			continue
 		}
-		if fill && tier <= v.tier && v.values[key] != nil && b.event == 0 {
+		if fill && !v.created && v.originalTier > 1 && v.values[key] != nil && b.event == 0 {
 			continue
 		}
 		if reflect.DeepEqual(v.values[key], value) {

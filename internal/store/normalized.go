@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -63,7 +64,12 @@ func ReplaceAttachments(ctx context.Context, tx *sql.Tx, account string, id int6
 			kind = "IMAGE"
 		}
 		if a.Key == "" {
-			return errors.New("attachment lacks stable identity")
+			if !a.Restricted {
+				return errors.New("attachment lacks stable identity")
+			}
+			// A restricted source may expose no remote identity or URL. Keep this
+			// unavailable slot local rather than merging unrelated unknown assets.
+			a.Key = "unidentified:" + strconv.FormatInt(id, 10) + ":" + strconv.Itoa(i)
 		}
 		asset, err := EnsureAsset(ctx, tx, account, a.Key, kind, a.URLs, a.Restricted)
 		if err != nil {

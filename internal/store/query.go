@@ -40,6 +40,7 @@ type Record struct {
 }
 
 type User struct {
+	AvatarAssetID     *int64  `json:"avatar_asset_id,omitempty"`
 	Username          *string `json:"username,omitempty"`
 	Name              *string `json:"name,omitempty"`
 	AvatarURL         *string `json:"avatar_url,omitempty"`
@@ -55,20 +56,23 @@ type User struct {
 }
 
 type Thread struct {
-	Title        *string  `json:"title,omitempty"`
-	ImageURL     *string  `json:"image_url,omitempty"`
-	Folder       *string  `json:"folder,omitempty"`
-	Subtype      *string  `json:"subtype,omitempty"`
-	ActivityAt   int64    `json:"activity_at_ms"`
-	ReadAt       *int64   `json:"read_at_ms,omitempty"`
-	InputMode    *int64   `json:"input_mode,omitempty"`
-	Reachability *string  `json:"reachability,omitempty"`
-	Group        *bool    `json:"group,omitempty"`
-	Muted        *bool    `json:"muted,omitempty"`
-	Pinned       *bool    `json:"pinned,omitempty"`
-	Unread       *bool    `json:"unread,omitempty"`
-	Deleted      bool     `json:"deleted,omitempty"`
-	Members      []Member `json:"members,omitempty"`
+	ImageAssetID   *int64          `json:"image_asset_id,omitempty"`
+	Capabilities   json.RawMessage `json:"capabilities,omitempty"`
+	PinnedMessages []int64         `json:"pinned_message_ids,omitempty"`
+	Title          *string         `json:"title,omitempty"`
+	ImageURL       *string         `json:"image_url,omitempty"`
+	Folder         *string         `json:"folder,omitempty"`
+	Subtype        *string         `json:"subtype,omitempty"`
+	ActivityAt     int64           `json:"activity_at_ms"`
+	ReadAt         *int64          `json:"read_at_ms,omitempty"`
+	InputMode      *int64          `json:"input_mode,omitempty"`
+	Reachability   *string         `json:"reachability,omitempty"`
+	Group          *bool           `json:"group,omitempty"`
+	Muted          *bool           `json:"muted,omitempty"`
+	Pinned         *bool           `json:"pinned,omitempty"`
+	Unread         *bool           `json:"unread,omitempty"`
+	Deleted        bool            `json:"deleted,omitempty"`
+	Members        []Member        `json:"members,omitempty"`
 }
 
 type Member struct {
@@ -80,27 +84,29 @@ type Member struct {
 }
 
 type Message struct {
-	ThreadID      *int64       `json:"thread_id,omitempty"`
-	SenderID      *int64       `json:"sender_id,omitempty"`
-	Sender        string       `json:"sender,omitempty"`
-	Reply         *Reply       `json:"reply,omitempty"`
-	SentAt        int64        `json:"sent_at_ms"`
-	Body          *string      `json:"body,omitempty"`
-	Kind          *string      `json:"content_type,omitempty"`
-	Snippet       *string      `json:"snippet,omitempty"`
-	Attachments   []Attachment `json:"attachments,omitempty"`
-	Edits         []Edit       `json:"edits,omitempty"`
-	EditedAt      *int64       `json:"edited_at_ms,omitempty"`
-	ExpiresAt     *int64       `json:"expires_at_ms,omitempty"`
-	ViewExpiresAt *int64       `json:"view_expires_at_ms,omitempty"`
-	Forwarded     *bool        `json:"forwarded,omitempty"`
-	Pinned        *bool        `json:"pinned,omitempty"`
-	Reported      *bool        `json:"reported,omitempty"`
-	AIGenerated   *bool        `json:"ai_generated,omitempty"`
-	Deleted       bool         `json:"deleted,omitempty"`
-	Placeholder   bool         `json:"placeholder,omitempty"`
-	Reactions     []Reaction   `json:"reactions,omitempty"`
-	Mentions      []Mention    `json:"mentions,omitempty"`
+	BotResponseID   *string      `json:"bot_response_id,omitempty"`
+	TombstoneReason *string      `json:"tombstone_reason,omitempty"`
+	ThreadID        *int64       `json:"thread_id,omitempty"`
+	SenderID        *int64       `json:"sender_id,omitempty"`
+	Sender          string       `json:"sender,omitempty"`
+	Reply           *Reply       `json:"reply,omitempty"`
+	SentAt          int64        `json:"sent_at_ms"`
+	Body            *string      `json:"body,omitempty"`
+	Kind            *string      `json:"content_type,omitempty"`
+	Snippet         *string      `json:"snippet,omitempty"`
+	Attachments     []Attachment `json:"attachments,omitempty"`
+	Edits           []Edit       `json:"edits,omitempty"`
+	EditedAt        *int64       `json:"edited_at_ms,omitempty"`
+	ExpiresAt       *int64       `json:"expires_at_ms,omitempty"`
+	ViewExpiresAt   *int64       `json:"view_expires_at_ms,omitempty"`
+	Forwarded       *bool        `json:"forwarded,omitempty"`
+	Pinned          *bool        `json:"pinned,omitempty"`
+	Reported        *bool        `json:"reported,omitempty"`
+	AIGenerated     *bool        `json:"ai_generated,omitempty"`
+	Deleted         bool         `json:"deleted,omitempty"`
+	Placeholder     bool         `json:"placeholder,omitempty"`
+	Reactions       []Reaction   `json:"reactions,omitempty"`
+	Mentions        []Mention    `json:"mentions,omitempty"`
 }
 
 type Reply struct {
@@ -150,9 +156,7 @@ func (s *Store) ResolveEntity(ctx context.Context, account, kind, ref string) (i
 			}
 		}
 	case "messages":
-		if field == "id" || field == "message_id" {
-			ns = "message.mid"
-		}
+		ns = map[string]string{"id": "message.mid", "message_id": "message.mid", "mid": "message.mid", "otid": "message.otid", "offline_threading_id": "message.otid", "item_id": "message.item_id"}[field]
 	}
 	if ns == "" {
 		return 0, errors.New("unsupported source ID namespace")
@@ -187,16 +191,16 @@ func (s *Store) readPage(ctx context.Context, kind string, q Query, ascending bo
 	var selectSQL, order string
 	switch kind {
 	case "users":
-		selectSQL = `SELECT e.id,e.username,e.full_name,(SELECT url FROM media_asset_urls au WHERE au.account_id=e.account_id AND au.asset_id=e.avatar_asset_id AND url_role='primary'),e.verified,e.restricted,e.blocking,e.following,e.followed_by,e.ai_agent_type,e.latest_reel_at,e.latest_besties_at,e.reel_seen_at FROM users e`
+		selectSQL = `SELECT e.id,e.username,e.full_name,(SELECT url FROM media_asset_urls au WHERE au.account_id=e.account_id AND au.asset_id=e.avatar_asset_id AND url_role='primary'),e.verified,e.restricted,e.blocking,e.following,e.followed_by,e.ai_agent_type,e.latest_reel_at,e.latest_besties_at,e.reel_seen_at,e.avatar_asset_id FROM users e`
 		order = "0"
 	case "threads":
-		selectSQL = `SELECT e.id,e.title,(SELECT url FROM media_asset_urls au WHERE au.account_id=e.account_id AND au.asset_id=e.image_asset_id AND url_role='primary'),e.folder,e.subtype,coalesce(e.activity_at_ms,0),e.read_at_ms,e.input_mode,e.reachability,e.is_group,e.muted,e.pinned,e.unread,coalesce(e.deleted,0) FROM threads e`
+		selectSQL = `SELECT e.id,e.title,(SELECT url FROM media_asset_urls au WHERE au.account_id=e.account_id AND au.asset_id=e.image_asset_id AND url_role='primary'),e.folder,e.subtype,coalesce(e.activity_at_ms,0),e.read_at_ms,e.input_mode,e.reachability,e.is_group,e.muted,e.pinned,e.unread,coalesce(e.deleted,0),e.image_asset_id,e.capabilities FROM threads e`
 		order = "coalesce(e.activity_at_ms,0)"
 	case "messages":
 		selectSQL = `SELECT e.id,e.thread_id,e.sender_id,coalesce(u.full_name,u.username,''),e.reply_to_message_id,
  coalesce(r.is_placeholder=0 AND coalesce(r.deleted,0)=0,0),CASE WHEN r.is_placeholder=0 AND coalesce(r.deleted,0)=0 THEN r.body END,
  coalesce(e.sent_at_ms,0),e.body,e.kind,e.snippet,e.edited_at_ms,e.expires_at_ms,e.view_expires_at_ms,
- e.forwarded,e.pinned,e.reported,e.ai_generated,coalesce(e.deleted,0),e.is_placeholder
+ e.forwarded,e.pinned,e.reported,e.ai_generated,coalesce(e.deleted,0),e.is_placeholder,e.bot_response_id,e.tombstone_reason
  FROM messages e LEFT JOIN users u ON u.user_id=e.sender_id AND u.account_id=e.account_id LEFT JOIN messages r ON r.message_id=e.reply_to_message_id AND r.account_id=e.account_id`
 		order = "e.sent_at_ms"
 	default:
@@ -337,17 +341,21 @@ func scanEntity(rows *sql.Rows, account, kind string) (Record, error) {
 	switch kind {
 	case "users":
 		u := &User{}
-		err = rows.Scan(&r.ID, &u.Username, &u.Name, &u.AvatarURL, &u.Verified, &u.Restricted, &u.Blocking, &u.Following, &u.FollowedBy, &u.AIAgentType, &u.LatestReel, &u.LatestBestiesReel, &u.ReelSeenAt)
+		err = rows.Scan(&r.ID, &u.Username, &u.Name, &u.AvatarURL, &u.Verified, &u.Restricted, &u.Blocking, &u.Following, &u.FollowedBy, &u.AIAgentType, &u.LatestReel, &u.LatestBestiesReel, &u.ReelSeenAt, &u.AvatarAssetID)
 		r.User = u
 	case "threads":
 		t := &Thread{}
-		err = rows.Scan(&r.ID, &t.Title, &t.ImageURL, &t.Folder, &t.Subtype, &t.ActivityAt, &t.ReadAt, &t.InputMode, &t.Reachability, &t.Group, &t.Muted, &t.Pinned, &t.Unread, &t.Deleted)
+		var capabilities *string
+		err = rows.Scan(&r.ID, &t.Title, &t.ImageURL, &t.Folder, &t.Subtype, &t.ActivityAt, &t.ReadAt, &t.InputMode, &t.Reachability, &t.Group, &t.Muted, &t.Pinned, &t.Unread, &t.Deleted, &t.ImageAssetID, &capabilities)
+		if capabilities != nil {
+			t.Capabilities = json.RawMessage(*capabilities)
+		}
 		r.Thread = t
 	case "messages":
 		m := &Message{}
 		var replyID *int64
 		var reply Reply
-		err = rows.Scan(&r.ID, &m.ThreadID, &m.SenderID, &m.Sender, &replyID, &reply.Available, &reply.Body, &m.SentAt, &m.Body, &m.Kind, &m.Snippet, &m.EditedAt, &m.ExpiresAt, &m.ViewExpiresAt, &m.Forwarded, &m.Pinned, &m.Reported, &m.AIGenerated, &m.Deleted, &m.Placeholder)
+		err = rows.Scan(&r.ID, &m.ThreadID, &m.SenderID, &m.Sender, &replyID, &reply.Available, &reply.Body, &m.SentAt, &m.Body, &m.Kind, &m.Snippet, &m.EditedAt, &m.ExpiresAt, &m.ViewExpiresAt, &m.Forwarded, &m.Pinned, &m.Reported, &m.AIGenerated, &m.Deleted, &m.Placeholder, &m.BotResponseID, &m.TombstoneReason)
 		if replyID != nil {
 			reply.ID = *replyID
 			m.Reply = &reply
@@ -381,15 +389,32 @@ func (s *Store) loadLinks(ctx context.Context, kind string, records []Record) er
 		if err != nil {
 			return err
 		}
-		defer rows.Close()
 		for rows.Next() {
 			var id int64
 			var m Member
 			if err = rows.Scan(&id, &m.UserID, &m.Name, &m.Nickname, &m.Admin, &m.ReadAt); err != nil {
+				rows.Close()
 				return err
 			}
 			t := index[id].Thread
 			t.Members = append(t.Members, m)
+		}
+		err = rows.Err()
+		rows.Close()
+		if err != nil {
+			return err
+		}
+		rows, err = s.queryContext(ctx, `SELECT thread_id,message_id FROM thread_pinned_messages WHERE account_id=? AND thread_id`+in+" ORDER BY thread_id,message_id", append([]any{records[0].Account}, args...)...)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var id, message int64
+			if err = rows.Scan(&id, &message); err != nil {
+				return err
+			}
+			index[id].Thread.PinnedMessages = append(index[id].Thread.PinnedMessages, message)
 		}
 		return rows.Err()
 	}

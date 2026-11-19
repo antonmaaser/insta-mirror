@@ -86,7 +86,8 @@ func allowed(u *url.URL) bool {
 	}
 	return false
 }
-func DescribeAttachments(msg slidetypes.Message, expiring bool) []store.Attachment {
+func DescribeAttachments(msg slidetypes.Message, expiring bool) ([]store.Attachment, error) {
+	var describeErr error
 	out := []store.Attachment{}
 	add := func(ref string, urls ...string) {
 		nonempty := []string{}
@@ -95,9 +96,14 @@ func DescribeAttachments(msg slidetypes.Message, expiring bool) []store.Attachme
 				nonempty = append(nonempty, u)
 			}
 		}
-		if len(nonempty) > 0 {
+		if len(nonempty) > 0 || ref != "" && ref != "fbid:" {
 			if ref == "" || ref == "fbid:" {
-				ref, _ = store.MediaKey("", nonempty)
+				var err error
+				ref, err = store.MediaKey("", nonempty)
+				if err != nil {
+					describeErr = err
+					return
+				}
 			}
 			out = append(out, store.Attachment{Key: ref, URLs: nonempty, Kind: msg.ContentType})
 		}
@@ -105,7 +111,16 @@ func DescribeAttachments(msg slidetypes.Message, expiring bool) []store.Attachme
 	ordinary := func(items []*slidetypes.Attachment) {
 		for _, a := range items {
 			if a != nil {
+				before := len(out)
 				add("fbid:"+a.AttachmentFBID, a.AttachmentCDNURL, a.AttachmentCDNFallbackURL)
+				if len(out) > before {
+					if a.AttachmentFBID != "" {
+						remote := a.AttachmentFBID
+						out[len(out)-1].RemoteEntityID = &remote
+					}
+					typ := int64(a.AttachmentType)
+					out[len(out)-1].RemoteEntityType = &typ
+				}
 			}
 		}
 	}
@@ -137,11 +152,48 @@ func DescribeAttachments(msg slidetypes.Message, expiring bool) []store.Attachme
 				image = content.XMA.XMAPreviewImage
 			}
 			if image != nil {
+				before := len(out)
 				add("", image.URL, image.FallbackURL)
+				if len(out) > before {
+					a := &out[len(out)-1]
+					x := content.XMA
+					if x.TargetID != "" {
+						a.RemoteEntityID = &x.TargetID
+					}
+					if x.TitleText != "" {
+						a.Title = &x.TitleText
+					} else if x.XMATitle != "" {
+						a.Title = &x.XMATitle
+					}
+					if x.SubtitleText != "" {
+						a.Subtitle = &x.SubtitleText
+					}
+					if x.TargetURL != "" {
+						a.TargetURL = &x.TargetURL
+					}
+				}
 			}
 		}
-	case *slidetypes.MessageContentRavenImage, *slidetypes.MessageContentRavenVideo:
-		out = append(out, store.Attachment{Key: "restricted-ephemeral-media", Restricted: true, Kind: msg.ContentType})
+	case *slidetypes.MessageContentRavenImage:
+		before := len(out)
+		ordinary([]*slidetypes.Attachment{content.Attachment})
+		if len(out) == before {
+			out = append(out, store.Attachment{Kind: msg.ContentType})
+		}
+		for i := before; i < len(out); i++ {
+			out[i].Restricted = true
+			out[i].URLs = nil
+		}
+	case *slidetypes.MessageContentRavenVideo:
+		before := len(out)
+		ordinary([]*slidetypes.Attachment{content.Attachment})
+		if len(out) == before {
+			out = append(out, store.Attachment{Kind: msg.ContentType})
+		}
+		for i := before; i < len(out); i++ {
+			out[i].Restricted = true
+			out[i].URLs = nil
+		}
 	}
 	if expiring {
 		for i := range out {
@@ -149,7 +201,7 @@ func DescribeAttachments(msg slidetypes.Message, expiring bool) []store.Attachme
 			out[i].URLs = nil
 		}
 	}
-	return out
+	return out, describeErr
 }
 func (c *Cache) Sync(ctx context.Context, account string) error {
 	var after int64

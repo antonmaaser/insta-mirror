@@ -8,8 +8,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -80,7 +82,14 @@ func Open(path string) (*Store, error) {
 	if err = os.Chmod(path, 0600); err != nil {
 		return nil, err
 	}
-	db, err := sql.Open("sqlite", path)
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return nil, err
+	}
+	u := url.URL{Scheme: "file", Path: abs}
+	q := url.Values{"_pragma": {"foreign_keys(1)", "busy_timeout(10000)"}}
+	u.RawQuery = q.Encode()
+	db, err := sql.Open("sqlite", u.String())
 	if err != nil {
 		return nil, err
 	}
@@ -168,7 +177,17 @@ func SaveState(ctx context.Context, tx *sql.Tx, account, scope, id string, value
 		if err != nil {
 			return err
 		}
-		_, err = tx.ExecContext(ctx, `INSERT INTO sync_cursors(account_id,scope,scope_id,revision,cursor,anchor_remote_id,page_fingerprint,complete,last_success_ms,target,candidate,generation) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(account_id,scope,scope_id) DO UPDATE SET revision=excluded.revision,cursor=excluded.cursor,anchor_remote_id=excluded.anchor_remote_id,page_fingerprint=excluded.page_fingerprint,complete=excluded.complete,last_success_ms=excluded.last_success_ms,target=excluded.target,candidate=excluded.candidate,generation=excluded.generation`, account, cs, id, v.Revision, v.Cursor, v.Anchor, hash, v.Complete, v.LastSuccess, v.Target, v.Candidate, v.Generation)
+		anchor := v.Anchor
+		if anchor != "" && cs != "inbox" {
+			local, err := strconv.ParseInt(anchor, 10, 64)
+			if err != nil {
+				return err
+			}
+			if err = tx.QueryRowContext(ctx, `SELECT remote_id FROM message_identities WHERE account_id=? AND message_id=? AND namespace='mid' ORDER BY remote_id LIMIT 1`, account, local).Scan(&anchor); err != nil {
+				return err
+			}
+		}
+		_, err = tx.ExecContext(ctx, `INSERT INTO sync_cursors(account_id,scope,scope_id,revision,cursor,anchor_remote_id,page_fingerprint,complete,last_success_ms,target,candidate,generation) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(account_id,scope,scope_id) DO UPDATE SET revision=excluded.revision,cursor=excluded.cursor,anchor_remote_id=excluded.anchor_remote_id,page_fingerprint=excluded.page_fingerprint,complete=excluded.complete,last_success_ms=excluded.last_success_ms,target=excluded.target,candidate=excluded.candidate,generation=excluded.generation`, account, cs, id, v.Revision, v.Cursor, anchor, hash, v.Complete, v.LastSuccess, v.Target, v.Candidate, v.Generation)
 		if err != nil {
 			return err
 		}
@@ -206,6 +225,13 @@ func readState(ctx context.Context, q stateReader, account, scope, id string, ou
 		err = q.queryRowContext(ctx, `SELECT revision,cursor,anchor_remote_id,page_fingerprint,complete,last_success_ms,target,candidate,generation FROM sync_cursors WHERE account_id=? AND scope=? AND scope_id=?`, account, cs, id).Scan(&out.Revision, &out.Cursor, &out.Anchor, &hash, &out.Complete, &out.LastSuccess, &out.Target, &out.Candidate, &out.Generation)
 		if err != nil {
 			return err
+		}
+		if out.Anchor != "" && cs != "inbox" {
+			var local int64
+			if err = q.queryRowContext(ctx, `SELECT message_id FROM message_identities WHERE account_id=? AND namespace='mid' AND remote_id=?`, account, out.Anchor).Scan(&local); err != nil {
+				return err
+			}
+			out.Anchor = strconv.FormatInt(local, 10)
 		}
 		out.PageHash = hex.EncodeToString(hash)
 	}

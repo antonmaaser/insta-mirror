@@ -120,13 +120,6 @@ func (s *Server) callSnapshot(ctx context.Context, name string, q store.Query) (
 	}
 	out.Next = page.Next
 	out.Items = page.Records
-	for _, r := range out.Items {
-		if r.Message != nil {
-			for i := range r.Message.Attachments {
-				r.Message.Attachments[i].URLs = nil
-			}
-		}
-	}
 	out.Availability = "partial"
 	if len(page.Records) == 0 {
 		out.Availability = "unavailable"

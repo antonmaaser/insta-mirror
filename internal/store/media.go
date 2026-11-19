@@ -20,10 +20,10 @@ func CanonicalMediaURL(raw string) (string, error) {
 	if strings.HasPrefix(host, "scontent-") && strings.HasSuffix(host, ".cdninstagram.com") {
 		host = "cdninstagram.com"
 	}
-	u.Host = host
 	if port := u.Port(); port != "" && port != "443" {
 		return "", errors.New("unsupported media port")
 	}
+	u.Host = host
 	u.Fragment = ""
 	q := u.Query()
 	for _, key := range []string{"oh", "oe", "_nc_gid", "_nc_ohc", "_nc_oc", "_nc_ht", "_nc_sid", "_nc_cat", "_nc_ss", "_nc_ct", "_nc_map", "ccb", "efg"} {
@@ -134,7 +134,15 @@ func mediaScan(row interface{ Scan(...any) error }) (Media, error) {
 	return m, err
 }
 func (s *Store) SaveMedia(ctx context.Context, m Media) error {
-	_, err := s.DB.ExecContext(ctx, `UPDATE media_assets SET download_status=?,content_sha256=?,mime_type=?,byte_size=?,last_attempt_ms=?,attempts=?,last_error=? WHERE account_id=? AND asset_id=? AND download_status<>'available'`, m.Status, m.Hash, m.MIME, m.Size, m.Attempted, m.Attempts, m.Error, m.Account, m.AssetID)
+	primary, fallback := "", ""
+	if len(m.URLs) > 0 {
+		primary = m.URLs[0]
+	}
+	if len(m.URLs) > 1 {
+		fallback = m.URLs[1]
+	}
+	_, err := s.DB.ExecContext(ctx, `UPDATE media_assets SET download_status=?,content_sha256=?,mime_type=?,byte_size=?,last_attempt_ms=?,attempts=?,last_error=? WHERE account_id=? AND asset_id=? AND download_status<>'available' AND (?='available' OR (coalesce((SELECT url FROM media_asset_urls u WHERE u.account_id=media_assets.account_id AND u.asset_id=media_assets.asset_id AND u.url_role='primary'),'')=? AND coalesce((SELECT url FROM media_asset_urls u WHERE u.account_id=media_assets.account_id AND u.asset_id=media_assets.asset_id AND u.url_role='fallback'),'')=?))`, m.Status, m.Hash, m.MIME, m.Size, m.Attempted, m.Attempts, m.Error, m.Account, m.AssetID, m.Status, primary, fallback)
+
 	return err
 }
 func (s *Store) PendingMedia(ctx context.Context, account string, after int64) ([]Media, error) {
@@ -178,7 +186,7 @@ func (s *Store) PendingMedia(ctx context.Context, account string, after int64) (
 	return out, nil
 }
 func (s *Store) Media(ctx context.Context, account string, message int64) ([]Media, error) {
-	rows, err := s.queryContext(ctx, `SELECT `+mediaColumns+` FROM message_attachments x JOIN media_assets a ON a.account_id=x.account_id AND a.asset_id=x.asset_id JOIN messages m ON m.account_id=x.account_id AND m.message_id=x.message_id WHERE x.account_id=? AND x.message_id=? AND m.deleted=0 AND m.is_placeholder=0 ORDER BY x.ordinal`, account, message)
+	rows, err := s.queryContext(ctx, `SELECT `+mediaColumns+` FROM message_attachments x JOIN media_assets a ON a.account_id=x.account_id AND a.asset_id=x.asset_id JOIN messages m ON m.account_id=x.account_id AND m.message_id=x.message_id WHERE x.account_id=? AND x.message_id=? AND m.deleted=0 AND m.is_placeholder=0 AND coalesce(m.expires_at_ms,0)=0 AND coalesce(m.view_expires_at_ms,0)=0 ORDER BY x.ordinal`, account, message)
 	if err != nil {
 		return nil, err
 	}
@@ -195,7 +203,7 @@ func (s *Store) Media(ctx context.Context, account string, message int64) ([]Med
 	return out, rows.Err()
 }
 func (s *Store) MediaHash(ctx context.Context, account, hash string) (Media, error) {
-	return mediaScan(s.queryRowContext(ctx, `SELECT `+mediaColumns+` FROM media_assets a WHERE a.account_id=? AND a.content_sha256=? AND a.download_status='available' AND (EXISTS(SELECT 1 FROM message_attachments x JOIN messages m ON m.account_id=x.account_id AND m.message_id=x.message_id WHERE x.account_id=a.account_id AND x.asset_id=a.asset_id AND m.deleted=0 AND m.is_placeholder=0) OR EXISTS(SELECT 1 FROM users u WHERE u.account_id=a.account_id AND u.avatar_asset_id=a.asset_id) OR EXISTS(SELECT 1 FROM threads t WHERE t.account_id=a.account_id AND t.image_asset_id=a.asset_id AND t.deleted=0)) LIMIT 1`, account, hash))
+	return mediaScan(s.queryRowContext(ctx, `SELECT `+mediaColumns+` FROM media_assets a WHERE a.account_id=? AND a.content_sha256=? AND a.download_status='available' AND (EXISTS(SELECT 1 FROM message_attachments x JOIN messages m ON m.account_id=x.account_id AND m.message_id=x.message_id WHERE x.account_id=a.account_id AND x.asset_id=a.asset_id AND m.deleted=0 AND m.is_placeholder=0 AND coalesce(m.expires_at_ms,0)=0 AND coalesce(m.view_expires_at_ms,0)=0) OR EXISTS(SELECT 1 FROM users u WHERE u.account_id=a.account_id AND u.avatar_asset_id=a.asset_id) OR EXISTS(SELECT 1 FROM threads t WHERE t.account_id=a.account_id AND t.image_asset_id=a.asset_id AND t.deleted=0)) LIMIT 1`, account, hash))
 }
 
 type MediaListing struct {
@@ -205,7 +213,7 @@ type MediaListing struct {
 }
 
 func (s *Store) ListMedia(ctx context.Context, account string) ([]MediaListing, error) {
-	rows, err := s.queryContext(ctx, `SELECT DISTINCT a.content_sha256,a.mime_type,a.byte_size,coalesce(nullif(u.full_name,''),nullif(u.username,''),'Unknown sender') FROM media_assets a JOIN message_attachments x ON x.account_id=a.account_id AND x.asset_id=a.asset_id JOIN messages m ON m.account_id=x.account_id AND m.message_id=x.message_id LEFT JOIN users u ON u.account_id=m.account_id AND u.user_id=m.sender_id WHERE a.account_id=? AND a.download_status='available' AND m.is_placeholder=0 AND m.deleted=0 ORDER BY a.content_sha256`, account)
+	rows, err := s.queryContext(ctx, `SELECT DISTINCT a.content_sha256,a.mime_type,a.byte_size,coalesce(nullif(u.full_name,''),nullif(u.username,''),'Unknown sender') FROM media_assets a JOIN message_attachments x ON x.account_id=a.account_id AND x.asset_id=a.asset_id JOIN messages m ON m.account_id=x.account_id AND m.message_id=x.message_id LEFT JOIN users u ON u.account_id=m.account_id AND u.user_id=m.sender_id WHERE a.account_id=? AND a.download_status='available' AND m.is_placeholder=0 AND m.deleted=0 AND coalesce(m.expires_at_ms,0)=0 AND coalesce(m.view_expires_at_ms,0)=0 ORDER BY a.content_sha256`, account)
 	if err != nil {
 		return nil, err
 	}

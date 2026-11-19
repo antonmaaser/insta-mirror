@@ -134,8 +134,8 @@ func (e *Engine) applyPage(ctx context.Context, raw []byte, spec pageSpec) error
 		b.fill = spec.Scope == "thread" || spec.Messages && !spec.Start || realtime.Revision != spec.RealtimeRevision
 		now := time.Now().UnixMilli()
 		// No reliable item version token exists in the current upstream types. Hash the
-		// complete parent/page content, and skip only a repeated terminal head page.
-		if spec.Messages && spec.Start && !spec.Preserve && prior.Complete && !page.Info.HasNextPage && prior.PageHash == pageHash && realtime.Revision == spec.RealtimeRevision {
+		// complete parent/page content, and skip only a repeated completed head acquisition.
+		if spec.Messages && spec.Start && !spec.Preserve && prior.Complete && prior.PageHash == pageHash && realtime.Revision == spec.RealtimeRevision {
 			pending, err := b.pendingThreadMedia(spec.ID)
 			if err != nil {
 				return err

@@ -237,7 +237,7 @@ func (b *ingestion) user(raw json.RawMessage, igid, fbid, name string, fill bool
 	if err != nil {
 		return 0, err
 	}
-	if b.memo("users", id, o) {
+	if b.memo("users", id, o, name, fill) {
 		return id, nil
 	}
 	values, err := o.fields(profileFields)
@@ -293,7 +293,7 @@ func (b *ingestion) thread(raw json.RawMessage, expected int64, remote string, c
 	if err != nil {
 		return 0, err
 	}
-	if b.memo("threads", id, o) {
+	if b.memo("threads", id, o, complete) {
 		return id, nil
 	}
 	values, err := o.fields(threadFields)
@@ -619,11 +619,13 @@ func (b *ingestion) message(raw json.RawMessage, thread int64, quote bool) (int6
 	defer func() { b.tier = oldTier }()
 	aliases := addAlias(nil, "message.mid", "", o.id("id"))
 	aliases = addAlias(aliases, "message.mid", "", o.id("message_id"))
+	aliases = addAlias(aliases, "message.otid", "", o.id("offline_threading_id"))
+	aliases = addAlias(aliases, "message.item_id", "", o.id("item_id"))
 	id, created, bound, err := b.resolve("messages", aliases, "message.mid", 0)
 	if err != nil {
 		return 0, err
 	}
-	if b.memo("messages", id, o) {
+	if b.memo("messages", id, o, thread, quote) {
 		return id, nil
 	}
 	if ref := o.id("thread_fbid"); ref != "" {
@@ -706,7 +708,11 @@ func (b *ingestion) message(raw json.RawMessage, thread int64, quote bool) (int6
 			msg.ContentType = kind
 		}
 		expiring := o.id("expiration_timestamp_ms") != "" || o.id("view_expiration_timestamp_ms") != ""
-		values["attachments"] = store.JSONValue(media.DescribeAttachments(msg, expiring))
+		attachments, err := media.DescribeAttachments(msg, expiring)
+		if err != nil {
+			return 0, err
+		}
+		values["attachments"] = attachments
 		if values["kind"] == nil && msg.Content.TypeName != "" {
 			values["kind"] = msg.Content.TypeName
 		}
@@ -734,7 +740,7 @@ func (b *ingestion) message(raw json.RawMessage, thread int64, quote bool) (int6
 			}
 			edits = append(edits, store.Edit{Body: edit.Body, At: at})
 		}
-		values["edits"] = store.JSONValue(edits)
+		values["edits"] = edits
 		if sourceEdit > 0 {
 			values["edited_at_ms"] = sourceEdit
 		}
@@ -777,7 +783,7 @@ func (b *ingestion) message(raw json.RawMessage, thread int64, quote bool) (int6
 		fields = append(fields, more...)
 	}
 	b.decision("messages", id, created, bound, fields)
-	b.unsupported("messages", id, o, messageFields, "id", "message_id", "thread_fbid", "sender_fbid", "sender", "replied_to_message_id", "replied_to_message", "content", "slide_edit_history", "reactions", "mentions", "offline_threading_id", "__typename")
+	b.unsupported("messages", id, o, messageFields, "id", "message_id", "thread_fbid", "sender_fbid", "sender", "replied_to_message_id", "replied_to_message", "content", "slide_edit_history", "reactions", "mentions", "offline_threading_id", "item_id", "__typename")
 	if !quote {
 		if err = b.messageRelations(id, thread, o, fill); err != nil {
 			return 0, err
@@ -826,7 +832,7 @@ func (b *ingestion) messageRelations(id, thread int64, o sourceObject, fill bool
 		if err != nil {
 			return err
 		}
-		if fill || b.incomingTier() < local.tier {
+		if (fill && !local.created && local.originalTier >= 3) || b.incomingTier() < local.tier {
 			b.ignored("messages", id, []string{key})
 			continue
 		}
@@ -1151,7 +1157,7 @@ func (b *ingestion) delta(raw json.RawMessage, delta slidetypes.Delta) error {
 			edits = append(edits, history...)
 			if len(edits) == 0 || edits[len(edits)-1] != (store.Edit{Body: text, At: at}) {
 				edits = append(edits, store.Edit{Body: text, At: at})
-				values["edits"] = store.JSONValue(edits)
+				values["edits"] = edits
 			}
 		}
 		return messagePatch(values)
