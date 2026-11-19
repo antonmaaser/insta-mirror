@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	_ "modernc.org/sqlite"
 )
@@ -20,19 +21,28 @@ type Store struct {
 }
 
 type State struct {
-	Revision    int64    `json:"revision,omitempty"`
-	Anchor      string   `json:"anchor,omitempty"`
-	Target      string   `json:"target,omitempty"`
-	Candidate   string   `json:"candidate,omitempty"`
-	Generation  int64    `json:"generation,omitempty"`
-	PageHash    string   `json:"page_hash,omitempty"`
-	Cursor      string   `json:"cursor,omitempty"`
-	Complete    bool     `json:"complete"`
-	SeqID       int64    `json:"seq_id,omitempty"`
-	Timestamp   int64    `json:"timestamp_ms,omitempty"`
-	LastSuccess int64    `json:"last_success_ms,omitempty"`
-	Error       string   `json:"error,omitempty"`
-	Gaps        []string `json:"gaps,omitempty"`
+	Revision        int64    `json:"revision,omitempty"`
+	Anchor          string   `json:"anchor,omitempty"`
+	Target          string   `json:"target,omitempty"`
+	Candidate       string   `json:"candidate,omitempty"`
+	Generation      int64    `json:"generation,omitempty"`
+	PageHash        string   `json:"page_hash,omitempty"`
+	Cursor          string   `json:"cursor,omitempty"`
+	Complete        bool     `json:"complete"`
+	SeqID           int64    `json:"seq_id,omitempty"`
+	Timestamp       int64    `json:"timestamp_ms,omitempty"`
+	LastSuccess     int64    `json:"last_success_ms,omitempty"`
+	Error           string   `json:"error,omitempty"`
+	Gaps            []string `json:"gaps,omitempty"`
+	Connected       bool     `json:"connected,omitempty"`
+	ObservedAt      int64    `json:"observed_at_ms,omitempty"`
+	SubscribedSeqID int64    `json:"subscribed_seq_id,omitempty"`
+	LatestSeqID     int64    `json:"latest_seq_id,omitempty"`
+	Failures        int      `json:"failures,omitempty"`
+	SessionSaved    bool     `json:"session_saved,omitempty"`
+	LastValidated   int64    `json:"last_validated_ms,omitempty"`
+	EstablishedAt   int64    `json:"established_at_ms,omitempty"`
+	Coverage        string   `json:"coverage,omitempty"`
 }
 
 const schemaVersion = 6
@@ -112,30 +122,106 @@ func Hash(raw []byte) string {
 	return hex.EncodeToString(h[:])
 }
 
-func SaveState(ctx context.Context, tx *sql.Tx, account, scope, id string, state any) error {
-	b, err := json.Marshal(state)
+func EnsureAccount(ctx context.Context, tx *sql.Tx, account string) error {
+	_, err := tx.ExecContext(ctx, `INSERT INTO accounts(account_id,created_at_ms,updated_at_ms) VALUES(?,?,?) ON CONFLICT DO NOTHING`, account, time.Now().UnixMilli(), time.Now().UnixMilli())
+	return err
+}
+func cursorScope(scope string) string {
+	switch scope {
+	case "folder", "inbox":
+		return "inbox"
+	case "thread", "backfill":
+		return "backfill"
+	case "head":
+		return "head"
+	}
+	return ""
+}
+
+const stateColumns = "revision,coalesce(anchor,''),coalesce(target,''),coalesce(candidate,''),generation,coalesce(page_hash,''),coalesce(cursor,''),complete,seq_id,timestamp_ms,last_success_ms,error,coalesce(connected,0),coalesce(observed_at_ms,0),coalesce(subscribed_seq_id,0),coalesce(latest_seq_id,0),coalesce(failures,0),coalesce(session_saved,0),coalesce(last_validated_ms,0),coalesce(established_at_ms,0),coalesce(coverage,'')"
+
+func scanState(row interface{ Scan(...any) error }, out *State) error {
+	return row.Scan(&out.Revision, &out.Anchor, &out.Target, &out.Candidate, &out.Generation, &out.PageHash, &out.Cursor, &out.Complete, &out.SeqID, &out.Timestamp, &out.LastSuccess, &out.Error, &out.Connected, &out.ObservedAt, &out.SubscribedSeqID, &out.LatestSeqID, &out.Failures, &out.SessionSaved, &out.LastValidated, &out.EstablishedAt, &out.Coverage)
+}
+func SaveState(ctx context.Context, tx *sql.Tx, account, scope, id string, value any) error {
+	var v State
+	if typed, ok := value.(State); ok {
+		v = typed
+	} else {
+		raw, err := json.Marshal(value)
+		if err != nil {
+			return err
+		}
+		if err = json.Unmarshal(raw, &v); err != nil {
+			return err
+		}
+	}
+	if err := EnsureAccount(ctx, tx, account); err != nil {
+		return err
+	}
+	_, err := tx.ExecContext(ctx, `INSERT INTO operational_state(account_id,scope,scope_id,revision,anchor,target,candidate,generation,page_hash,cursor,complete,seq_id,timestamp_ms,last_success_ms,error,connected,observed_at_ms,subscribed_seq_id,latest_seq_id,failures,session_saved,last_validated_ms,established_at_ms,coverage) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(account_id,scope,scope_id) DO UPDATE SET revision=excluded.revision,anchor=excluded.anchor,target=excluded.target,candidate=excluded.candidate,generation=excluded.generation,page_hash=excluded.page_hash,cursor=excluded.cursor,complete=excluded.complete,seq_id=excluded.seq_id,timestamp_ms=excluded.timestamp_ms,last_success_ms=excluded.last_success_ms,error=excluded.error,connected=excluded.connected,observed_at_ms=excluded.observed_at_ms,subscribed_seq_id=excluded.subscribed_seq_id,latest_seq_id=excluded.latest_seq_id,failures=excluded.failures,session_saved=excluded.session_saved,last_validated_ms=excluded.last_validated_ms,established_at_ms=excluded.established_at_ms,coverage=excluded.coverage`, account, scope, id, v.Revision, v.Anchor, v.Target, v.Candidate, v.Generation, v.PageHash, v.Cursor, v.Complete, v.SeqID, v.Timestamp, v.LastSuccess, v.Error, v.Connected, v.ObservedAt, v.SubscribedSeqID, v.LatestSeqID, v.Failures, v.SessionSaved, v.LastValidated, v.EstablishedAt, v.Coverage)
 	if err != nil {
 		return err
 	}
-	_, err = tx.ExecContext(ctx, `INSERT INTO sync_state VALUES(?,?,?,?) ON CONFLICT(account_id,scope,scope_id) DO UPDATE SET state=excluded.state`, account, scope, id, string(b))
-	return err
+	if cs := cursorScope(scope); cs != "" {
+		hash, err := hex.DecodeString(v.PageHash)
+		if err != nil {
+			return err
+		}
+		_, err = tx.ExecContext(ctx, `INSERT INTO sync_cursors(account_id,scope,scope_id,revision,cursor,anchor_remote_id,page_fingerprint,complete,last_success_ms,target,candidate,generation) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(account_id,scope,scope_id) DO UPDATE SET revision=excluded.revision,cursor=excluded.cursor,anchor_remote_id=excluded.anchor_remote_id,page_fingerprint=excluded.page_fingerprint,complete=excluded.complete,last_success_ms=excluded.last_success_ms,target=excluded.target,candidate=excluded.candidate,generation=excluded.generation`, account, cs, id, v.Revision, v.Cursor, v.Anchor, hash, v.Complete, v.LastSuccess, v.Target, v.Candidate, v.Generation)
+		if err != nil {
+			return err
+		}
+	}
+	if _, err = tx.ExecContext(ctx, `DELETE FROM operational_gaps WHERE account_id=? AND scope=? AND scope_id=?`, account, scope, id); err != nil {
+		return err
+	}
+	for i, gap := range v.Gaps {
+		if _, err = tx.ExecContext(ctx, `INSERT INTO operational_gaps VALUES(?,?,?,?,?)`, account, scope, id, i, gap); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 func (s *Store) State(ctx context.Context, account, scope, id string, out *State) error {
-	var b string
-	err := s.queryRowContext(ctx, `SELECT state FROM sync_state WHERE account_id=? AND scope=? AND scope_id=?`, account, scope, id).Scan(&b)
+	return readState(ctx, s, account, scope, id, out)
+}
+
+type stateReader interface {
+	queryRowContext(context.Context, string, ...any) *sql.Row
+	queryContext(context.Context, string, ...any) (*sql.Rows, error)
+}
+
+func readState(ctx context.Context, q stateReader, account, scope, id string, out *State) error {
+	*out = State{}
+	err := scanState(q.queryRowContext(ctx, "SELECT "+stateColumns+" FROM operational_state WHERE account_id=? AND scope=? AND scope_id=?", account, scope, id), out)
 	if errors.Is(err, sql.ErrNoRows) {
-		*out = State{}
 		return nil
 	}
 	if err != nil {
 		return err
 	}
-	var decoded State
-	if err := json.Unmarshal([]byte(b), &decoded); err != nil {
+	if cs := cursorScope(scope); cs != "" {
+		var hash []byte
+		err = q.queryRowContext(ctx, `SELECT revision,cursor,anchor_remote_id,page_fingerprint,complete,last_success_ms,target,candidate,generation FROM sync_cursors WHERE account_id=? AND scope=? AND scope_id=?`, account, cs, id).Scan(&out.Revision, &out.Cursor, &out.Anchor, &hash, &out.Complete, &out.LastSuccess, &out.Target, &out.Candidate, &out.Generation)
+		if err != nil {
+			return err
+		}
+		out.PageHash = hex.EncodeToString(hash)
+	}
+	rows, err := q.queryContext(ctx, `SELECT detail FROM operational_gaps WHERE account_id=? AND scope=? AND scope_id=? ORDER BY ordinal`, account, scope, id)
+	if err != nil {
 		return err
 	}
-	*out = decoded
-	return nil
+	defer rows.Close()
+	for rows.Next() {
+		var gap string
+		if err = rows.Scan(&gap); err != nil {
+			return err
+		}
+		out.Gaps = append(out.Gaps, gap)
+	}
+	return rows.Err()
 }
 func (s *Store) Transaction(ctx context.Context, fn func(*sql.Tx) error) error {
 	tx, err := s.DB.BeginTx(ctx, nil)
@@ -152,38 +238,35 @@ func (s *Store) SetState(ctx context.Context, account, scope, id string, value a
 	return s.Transaction(ctx, func(tx *sql.Tx) error { return SaveState(ctx, tx, account, scope, id, value) })
 }
 func (s *Store) Status(ctx context.Context, account string) ([]map[string]any, error) {
-	rows, err := s.queryContext(ctx, `SELECT account_id,scope,scope_id,state FROM sync_state WHERE (?='' OR account_id=?) ORDER BY account_id,scope,scope_id`, account, account)
+	rows, err := s.queryContext(ctx, `SELECT account_id,scope,scope_id FROM operational_state WHERE (?='' OR account_id=?) ORDER BY account_id,scope,scope_id`, account, account)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	out := []map[string]any{}
+	type key struct{ a, scope, id string }
+	var keys []key
 	for rows.Next() {
-		var a, scope, id string
-		var b []byte
-		if err = rows.Scan(&a, &scope, &id, &b); err != nil {
+		var k key
+		if err = rows.Scan(&k.a, &k.scope, &k.id); err != nil {
+			rows.Close()
 			return nil, err
 		}
-		out = append(out, map[string]any{"account_id": a, "scope": scope, "scope_id": id, "state": json.RawMessage(b)})
+		keys = append(keys, k)
 	}
-	return out, rows.Err()
-}
-
-// ReadState reads on the same transaction that stores observations/checkpoints.
-func ReadState(ctx context.Context, tx *sql.Tx, account, scope, id string, out *State) error {
-	var raw string
-	err := tx.QueryRowContext(ctx, `SELECT state FROM sync_state WHERE account_id=? AND scope=? AND scope_id=?`, account, scope, id).Scan(&raw)
-	if errors.Is(err, sql.ErrNoRows) {
-		*out = State{}
-		return nil
-	}
+	err = rows.Err()
+	rows.Close()
 	if err != nil {
-		return err
+		return nil, err
 	}
-	var decoded State
-	if err := json.Unmarshal([]byte(raw), &decoded); err != nil {
-		return err
+	out := []map[string]any{}
+	for _, k := range keys {
+		var v State
+		if err = s.State(ctx, k.a, k.scope, k.id, &v); err != nil {
+			return nil, err
+		}
+		out = append(out, map[string]any{"account_id": k.a, "scope": k.scope, "scope_id": k.id, "state": v})
 	}
-	*out = decoded
-	return nil
+	return out, nil
+}
+func ReadState(ctx context.Context, tx *sql.Tx, account, scope, id string, out *State) error {
+	return readState(ctx, &Store{readTx: tx}, account, scope, id, out)
 }

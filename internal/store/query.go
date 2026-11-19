@@ -158,7 +158,8 @@ func (s *Store) ResolveEntity(ctx context.Context, account, kind, ref string) (i
 		return 0, errors.New("unsupported source ID namespace")
 	}
 	var id int64
-	err := s.queryRowContext(ctx, "SELECT "+aliasColumn(kind)+" FROM source_ids WHERE account_id=? AND namespace=? AND scope=? AND remote_id=?", account, ns, scope, value).Scan(&id)
+	clause, args := identityPredicate(kind, Alias{Namespace: ns, Scope: scope, RemoteID: value})
+	err := s.queryRowContext(ctx, "SELECT "+aliasColumn(kind)+" FROM "+identityTable(kind)+" WHERE account_id=? AND "+clause, append([]any{account}, args...)...).Scan(&id)
 	return id, err
 }
 
@@ -186,21 +187,22 @@ func (s *Store) readPage(ctx context.Context, kind string, q Query, ascending bo
 	var selectSQL, order string
 	switch kind {
 	case "users":
-		selectSQL = `SELECT e.id,e.username,e.name,e.avatar_url,e.verified,e.restricted,e.blocking,e.following,e.followed_by,e.ai_agent_type,e.latest_reel,e.latest_besties_reel,e.reel_seen_at FROM users e`
+		selectSQL = `SELECT e.id,e.username,e.full_name,(SELECT url FROM media_asset_urls au WHERE au.account_id=e.account_id AND au.asset_id=e.avatar_asset_id AND url_role='primary'),e.verified,e.restricted,e.blocking,e.following,e.followed_by,e.ai_agent_type,e.latest_reel_at,e.latest_besties_at,e.reel_seen_at FROM users e`
 		order = "0"
 	case "threads":
-		selectSQL = `SELECT e.id,e.title,e.image_url,e.folder,e.subtype,coalesce(e.activity_at,0),e.read_at,e.input_mode,e.reachability,e.is_group,e.muted,e.pinned,e.unread,coalesce(e.deleted,0) FROM threads e`
-		order = "coalesce(e.activity_at,0)"
+		selectSQL = `SELECT e.id,e.title,(SELECT url FROM media_asset_urls au WHERE au.account_id=e.account_id AND au.asset_id=e.image_asset_id AND url_role='primary'),e.folder,e.subtype,coalesce(e.activity_at_ms,0),e.read_at_ms,e.input_mode,e.reachability,e.is_group,e.muted,e.pinned,e.unread,coalesce(e.deleted,0) FROM threads e`
+		order = "coalesce(e.activity_at_ms,0)"
 	case "messages":
-		selectSQL = `SELECT e.id,e.thread_id,e.sender_id,coalesce(u.name,u.username,''),e.reply_id,
- coalesce(r.placeholder=0 AND coalesce(r.deleted,0)=0,0),CASE WHEN r.placeholder=0 AND coalesce(r.deleted,0)=0 THEN r.body END,
- coalesce(e.sent_at,0),e.body,e.kind,e.snippet,coalesce(e.attachments,'[]'),coalesce(e.edits,'[]'),e.edited_at,e.expires_at,e.view_expires_at,
- e.forwarded,e.pinned,e.reported,e.ai_generated,coalesce(e.deleted,0),e.placeholder
- FROM messages e LEFT JOIN users u ON u.id=e.sender_id LEFT JOIN messages r ON r.id=e.reply_id`
-		order = "e.sent_at"
+		selectSQL = `SELECT e.id,e.thread_id,e.sender_id,coalesce(u.full_name,u.username,''),e.reply_to_message_id,
+ coalesce(r.is_placeholder=0 AND coalesce(r.deleted,0)=0,0),CASE WHEN r.is_placeholder=0 AND coalesce(r.deleted,0)=0 THEN r.body END,
+ coalesce(e.sent_at_ms,0),e.body,e.kind,e.snippet,e.edited_at_ms,e.expires_at_ms,e.view_expires_at_ms,
+ e.forwarded,e.pinned,e.reported,e.ai_generated,coalesce(e.deleted,0),e.is_placeholder
+ FROM messages e LEFT JOIN users u ON u.user_id=e.sender_id AND u.account_id=e.account_id LEFT JOIN messages r ON r.message_id=e.reply_to_message_id AND r.account_id=e.account_id`
+		order = "e.sent_at_ms"
 	default:
 		return page, errors.New("unsupported entity kind")
 	}
+	selectSQL = strings.ReplaceAll(selectSQL, "e.id", "e."+aliasColumn(kind))
 	var where = []string{"e.account_id=?"}
 	args := []any{q.Account}
 	filter := func(clause string, value any) { where = append(where, clause); args = append(args, value) }
@@ -225,7 +227,7 @@ func (s *Store) readPage(ctx context.Context, kind string, q Query, ascending bo
 	}
 	if kind == "messages" {
 		if q.EntityID == 0 {
-			where = append(where, "e.placeholder=0")
+			where = append(where, "e.is_placeholder=0")
 		}
 		if q.ThreadID != "" {
 			id, err := s.ResolveEntity(ctx, q.Account, "threads", q.ThreadID)
@@ -251,10 +253,10 @@ func (s *Store) readPage(ctx context.Context, kind string, q Query, ascending bo
 			filter("instr(lower(coalesce(e.body,e.snippet,'')),lower(?))>0", q.Text)
 		}
 		if q.AfterMS != 0 {
-			filter("e.sent_at>=?", q.AfterMS)
+			filter("e.sent_at_ms>=?", q.AfterMS)
 		}
 		if q.BeforeMS != 0 {
-			filter("e.sent_at<?", q.BeforeMS)
+			filter("e.sent_at_ms<?", q.BeforeMS)
 		}
 	}
 	cursor := q.Cursor
@@ -277,7 +279,7 @@ func (s *Store) readPage(ctx context.Context, kind string, q Query, ascending bo
 	if kind != "users" {
 		orderBy = order + " " + direction + "," + orderBy
 	}
-	rows, err := s.queryContext(ctx, selectSQL+" WHERE "+strings.Join(where, " AND ")+" ORDER BY "+orderBy+" LIMIT ?", append(args, limit+1)...)
+	rows, err := s.queryContext(ctx, strings.ReplaceAll(selectSQL+" WHERE "+strings.Join(where, " AND ")+" ORDER BY "+orderBy+" LIMIT ?", "e.id", "e."+aliasColumn(kind)), append(args, limit+1)...)
 	if err != nil {
 		return page, err
 	}
@@ -306,6 +308,23 @@ func (s *Store) readPage(ctx context.Context, kind string, q Query, ascending bo
 		}
 		page.Next = base64.RawURLEncoding.EncodeToString([]byte(JSONValue(pos)))
 	}
+	if kind == "messages" {
+		for i := range page.Records {
+			r := &page.Records[i]
+			if r.Message.Deleted || r.Message.Placeholder {
+				continue
+			}
+			var e error
+			r.Message.Attachments, e = s.Attachments(ctx, r.Account, r.ID)
+			if e != nil {
+				return page, e
+			}
+			r.Message.Edits, e = s.Edits(ctx, r.Account, r.ID)
+			if e != nil {
+				return page, e
+			}
+		}
+	}
 	if err = s.loadLinks(ctx, kind, page.Records); err != nil {
 		return page, err
 	}
@@ -328,14 +347,7 @@ func scanEntity(rows *sql.Rows, account, kind string) (Record, error) {
 		m := &Message{}
 		var replyID *int64
 		var reply Reply
-		var attachments, edits []byte
-		err = rows.Scan(&r.ID, &m.ThreadID, &m.SenderID, &m.Sender, &replyID, &reply.Available, &reply.Body, &m.SentAt, &m.Body, &m.Kind, &m.Snippet, &attachments, &edits, &m.EditedAt, &m.ExpiresAt, &m.ViewExpiresAt, &m.Forwarded, &m.Pinned, &m.Reported, &m.AIGenerated, &m.Deleted, &m.Placeholder)
-		if err == nil {
-			err = json.Unmarshal(attachments, &m.Attachments)
-		}
-		if err == nil {
-			err = json.Unmarshal(edits, &m.Edits)
-		}
+		err = rows.Scan(&r.ID, &m.ThreadID, &m.SenderID, &m.Sender, &replyID, &reply.Available, &reply.Body, &m.SentAt, &m.Body, &m.Kind, &m.Snippet, &m.EditedAt, &m.ExpiresAt, &m.ViewExpiresAt, &m.Forwarded, &m.Pinned, &m.Reported, &m.AIGenerated, &m.Deleted, &m.Placeholder)
 		if replyID != nil {
 			reply.ID = *replyID
 			m.Reply = &reply
@@ -364,8 +376,8 @@ func (s *Store) loadLinks(ctx context.Context, kind string, records []Record) er
 	}
 	in := " IN (" + strings.TrimSuffix(strings.Repeat("?,", len(args)), ",") + ")"
 	if kind == "threads" {
-		rows, err := s.queryContext(ctx, `SELECT m.thread_id,m.user_id,coalesce(u.name,u.username,''),m.nickname,m.admin,m.read_at
- FROM thread_members m JOIN users u ON u.id=m.user_id WHERE m.member=1 AND m.thread_id`+in+" ORDER BY m.thread_id,m.user_id", args...)
+		rows, err := s.queryContext(ctx, `SELECT m.thread_id,m.user_id,coalesce(u.full_name,u.username,''),m.nickname,m.is_admin,m.read_at_ms
+ FROM thread_members m JOIN users u ON u.user_id=m.user_id AND u.account_id=m.account_id WHERE m.account_id=? AND m.is_active=1 AND m.thread_id`+in+" ORDER BY m.thread_id,m.user_id", append([]any{records[0].Account}, args...)...)
 		if err != nil {
 			return err
 		}
@@ -381,7 +393,7 @@ func (s *Store) loadLinks(ctx context.Context, kind string, records []Record) er
 		}
 		return rows.Err()
 	}
-	rows, err := s.queryContext(ctx, `SELECT message_id,user_id,reaction,reacted_at,log_message_id FROM message_reactions WHERE message_id`+in+" ORDER BY message_id,user_id", args...)
+	rows, err := s.queryContext(ctx, `SELECT message_id,user_id,reaction,reacted_at_ms,log_message_id FROM message_reactions WHERE account_id=? AND message_id`+in+" ORDER BY message_id,user_id", append([]any{records[0].Account}, args...)...)
 	if err != nil {
 		return err
 	}
@@ -400,7 +412,7 @@ func (s *Store) loadLinks(ctx context.Context, kind string, records []Record) er
 	if err != nil {
 		return err
 	}
-	rows, err = s.queryContext(ctx, `SELECT message_id,offset,length,kind,user_id,thread_id FROM message_mentions WHERE message_id`+in+" ORDER BY message_id,offset,length,kind", args...)
+	rows, err = s.queryContext(ctx, `SELECT message_id,offset,length,kind,mentioned_user_id,mentioned_thread_id FROM message_mentions WHERE account_id=? AND message_id`+in+" ORDER BY message_id,offset,length,kind", append([]any{records[0].Account}, args...)...)
 	if err != nil {
 		return err
 	}

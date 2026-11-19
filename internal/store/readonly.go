@@ -72,7 +72,7 @@ func (s *Store) queryRowContext(ctx context.Context, query string, args ...any) 
 }
 
 func (s *Store) Accounts(ctx context.Context) ([]string, error) {
-	rows, err := s.queryContext(ctx, `SELECT account_id FROM threads UNION SELECT account_id FROM messages UNION SELECT account_id FROM users UNION SELECT account_id FROM sync_state ORDER BY account_id`)
+	rows, err := s.queryContext(ctx, `SELECT account_id FROM accounts ORDER BY account_id`)
 	if err != nil {
 		return nil, err
 	}

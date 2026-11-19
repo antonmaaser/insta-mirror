@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 )
 
 const currentSchema = `CREATE TABLE accounts (
@@ -288,10 +289,17 @@ type Decision struct {
 }
 
 type Attachment struct {
-	Key        string   `json:"key"`
-	Kind       string   `json:"kind,omitempty"`
-	URLs       []string `json:"urls,omitempty"`
-	Restricted bool     `json:"restricted,omitempty"`
+	AssetID          int64    `json:"asset_id,omitempty"`
+	Ordinal          int      `json:"ordinal"`
+	RemoteEntityID   *string  `json:"remote_entity_id,omitempty"`
+	RemoteEntityType *int64   `json:"remote_entity_type,omitempty"`
+	Title            *string  `json:"title,omitempty"`
+	Subtitle         *string  `json:"subtitle,omitempty"`
+	TargetURL        *string  `json:"target_url,omitempty"`
+	Key              string   `json:"key"`
+	Kind             string   `json:"kind,omitempty"`
+	URLs             []string `json:"urls,omitempty"`
+	Restricted       bool     `json:"restricted,omitempty"`
 }
 
 type Edit struct {
@@ -315,15 +323,40 @@ func aliasColumn(kind string) string {
 	}
 }
 
+func identityTable(kind string) string {
+	switch kind {
+	case "users":
+		return "user_identities"
+	case "threads":
+		return "thread_identities"
+	case "messages":
+		return "message_identities"
+	}
+	panic("invalid identity kind")
+}
+func identityNamespace(ns string) string {
+	_, ns, _ = strings.Cut(ns, ".")
+	if ns == "key" {
+		return "thread_key"
+	}
+	return ns
+}
+func identityPredicate(kind string, a Alias) (string, []any) {
+	clause := "namespace=? AND remote_id=?"
+	args := []any{identityNamespace(a.Namespace), a.RemoteID}
+	if kind == "threads" {
+		clause += " AND scope=?"
+		args = append(args, a.Scope)
+	}
+	return clause, args
+}
 func aliasOwner(ctx context.Context, q interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
 }, account, kind string, a Alias) (int64, error) {
-	var id sql.NullInt64
-	err := q.QueryRowContext(ctx, "SELECT "+aliasColumn(kind)+" FROM source_ids WHERE account_id=? AND namespace=? AND scope=? AND remote_id=?", account, a.Namespace, a.Scope, a.RemoteID).Scan(&id)
-	if err == nil && !id.Valid {
-		return 0, ErrConflict
-	}
-	return id.Int64, err
+	clause, args := identityPredicate(kind, a)
+	var id int64
+	err := q.QueryRowContext(ctx, "SELECT "+aliasColumn(kind)+" FROM "+identityTable(kind)+" WHERE account_id=? AND "+clause, append([]any{account}, args...)...).Scan(&id)
+	return id, err
 }
 
 // ResolveAliases binds only IDs supplied together for the same source object.
@@ -350,8 +383,14 @@ func ResolveAliases(ctx context.Context, tx *sql.Tx, account, kind string, alias
 	}
 	if canonical >= 0 && canonical < int64(len(aliases)) && id != 0 {
 		a := aliases[canonical]
+		clause := "account_id=? AND " + aliasColumn(kind) + "=? AND namespace=? AND remote_id<>?"
+		args := []any{account, id, identityNamespace(a.Namespace), a.RemoteID}
+		if kind == "threads" {
+			clause += " AND scope=?"
+			args = append(args, a.Scope)
+		}
 		var other string
-		err := tx.QueryRowContext(ctx, "SELECT remote_id FROM source_ids WHERE account_id=? AND "+aliasColumn(kind)+"=? AND namespace=? AND scope=? AND remote_id<>? LIMIT 1", account, id, a.Namespace, a.Scope, a.RemoteID).Scan(&other)
+		err := tx.QueryRowContext(ctx, "SELECT remote_id FROM "+identityTable(kind)+" WHERE "+clause+" LIMIT 1", args...).Scan(&other)
 		if err == nil {
 			return id, false, false, ErrConflict
 		}
@@ -361,10 +400,13 @@ func ResolveAliases(ctx context.Context, tx *sql.Tx, account, kind string, alias
 	}
 	created := id == 0
 	if created {
-		if canonical < 0 || canonical >= int64(len(aliases)) {
+		if len(aliases) == 0 {
 			return 0, false, false, ErrDeferred
 		}
-		result, err := tx.ExecContext(ctx, "INSERT INTO "+kind+"(account_id) VALUES(?)", account)
+		if err := EnsureAccount(ctx, tx, account); err != nil {
+			return 0, false, false, err
+		}
+		result, err := tx.ExecContext(ctx, "INSERT INTO "+kind+"(account_id,fingerprint,updated_at_ms) VALUES(?,?,?)", account, make([]byte, 32), time.Now().UnixMilli())
 		if err != nil {
 			return 0, false, false, err
 		}
@@ -374,8 +416,15 @@ func ResolveAliases(ctx context.Context, tx *sql.Tx, account, kind string, alias
 		}
 	}
 	for _, a := range missing {
-		_, err := tx.ExecContext(ctx, "INSERT INTO source_ids(account_id,namespace,scope,remote_id,"+aliasColumn(kind)+") VALUES(?,?,?,?,?)", account, a.Namespace, a.Scope, a.RemoteID, id)
-		if err != nil {
+		columns := "account_id,namespace,remote_id," + aliasColumn(kind)
+		args := []any{account, identityNamespace(a.Namespace), a.RemoteID, id}
+		marks := "?,?,?,?"
+		if kind == "threads" {
+			columns += ",scope"
+			args = append(args, a.Scope)
+			marks += ",?"
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO "+identityTable(kind)+"("+columns+") VALUES("+marks+")", args...); err != nil {
 			return id, created, false, err
 		}
 	}
