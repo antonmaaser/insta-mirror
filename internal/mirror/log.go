@@ -113,7 +113,16 @@ func (e *Engine) ingestTransaction(ctx context.Context, acquisition string, appl
 	b := &ingestion{ctx: ctx, account: e.Account}
 	err := e.DB.Transaction(ctx, func(tx *sql.Tx) error {
 		b.tx = tx
-		return apply(b)
+		if _, err := tx.ExecContext(ctx, "PRAGMA defer_foreign_keys=ON"); err != nil {
+			return err
+		}
+		if err := store.EnsureAccount(ctx, tx, e.Account); err != nil {
+			return err
+		}
+		if err := apply(b); err != nil {
+			return err
+		}
+		return b.flush()
 	})
 	if err == nil {
 		e.Log.decisions(e.Account, acquisition, b.decisions)

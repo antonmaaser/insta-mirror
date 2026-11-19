@@ -19,6 +19,7 @@ func (e *Engine) captureDeltas(ctx context.Context, raw []byte) error {
 		return e.blockRealtime(ctx, errors.New("malformed realtime batch"))
 	}
 	err := e.ingestTransaction(ctx, "realtime", func(b *ingestion) error {
+		b.tier = 3
 		var state store.State
 		if err := store.ReadState(ctx, b.tx, e.Account, "realtime", "checkpoint", &state); err != nil {
 			return err

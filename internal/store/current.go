@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"sort"
 	"strings"
-	"time"
 )
 
 const currentSchema = `CREATE TABLE accounts (
@@ -361,7 +360,7 @@ func aliasOwner(ctx context.Context, q interface {
 
 // ResolveAliases binds only IDs supplied together for the same source object.
 // The caller rolls back the whole acquisition if any binding disagrees.
-func ResolveAliases(ctx context.Context, tx *sql.Tx, account, kind string, aliases []Alias, canonical, expected int64) (int64, bool, bool, error) {
+func ResolveAliases(ctx context.Context, tx *sql.Tx, account, kind string, aliases []Alias, canonical, expected int64, reserve func() (int64, error)) (int64, bool, bool, error) {
 	id := expected
 	var missing []Alias
 	for _, a := range aliases {
@@ -403,17 +402,12 @@ func ResolveAliases(ctx context.Context, tx *sql.Tx, account, kind string, alias
 		if len(aliases) == 0 {
 			return 0, false, false, ErrDeferred
 		}
-		if err := EnsureAccount(ctx, tx, account); err != nil {
-			return 0, false, false, err
-		}
-		result, err := tx.ExecContext(ctx, "INSERT INTO "+kind+"(account_id,fingerprint,updated_at_ms) VALUES(?,?,?)", account, make([]byte, 32), time.Now().UnixMilli())
+		var err error
+		id, err = reserve()
 		if err != nil {
 			return 0, false, false, err
 		}
-		id, err = result.LastInsertId()
-		if err != nil {
-			return 0, false, false, err
-		}
+
 	}
 	for _, a := range missing {
 		columns := "account_id,namespace,remote_id," + aliasColumn(kind)

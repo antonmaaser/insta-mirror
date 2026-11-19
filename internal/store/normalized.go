@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"sort"
 	"strings"
 )
 
@@ -44,6 +45,10 @@ func (s *Store) Edits(ctx context.Context, account string, id int64) ([]Edit, er
 	}
 	return out, rows.Err()
 }
+func (s *Store) EditsFromTx(ctx context.Context, tx *sql.Tx, account string, id int64) ([]Edit, error) {
+	return (&Store{readTx: tx}).Edits(ctx, account, id)
+}
+
 func ReplaceAttachments(ctx context.Context, tx *sql.Tx, account string, id int64, items []Attachment) error {
 	for i, a := range items {
 		kind := a.Kind
@@ -129,14 +134,33 @@ func canonicalRows(ctx context.Context, tx *sql.Tx, query string, args ...any) (
 
 // CanonicalContent includes persistent source state, never URL signatures or cache bookkeeping.
 func CanonicalContent(ctx context.Context, tx *sql.Tx, account, kind string, id int64) ([]byte, [32]byte, error) {
+	return CanonicalMergedContent(ctx, tx, account, kind, id, nil)
+}
+func CanonicalMergedContent(ctx context.Context, tx *sql.Tx, account, kind string, id int64, merged map[string]any) ([]byte, [32]byte, error) {
 	rows, err := canonicalRows(ctx, tx, "SELECT * FROM "+kind+" WHERE account_id=? AND "+aliasColumn(kind)+"=?", account, id)
 	if err != nil {
 		return nil, [32]byte{}, err
 	}
-	if len(rows) != 1 {
+	if len(rows) == 0 && merged == nil {
 		return nil, [32]byte{}, sql.ErrNoRows
 	}
-	content := canonicalEntity{Fields: rows[0]}
+	content := canonicalEntity{}
+	if len(rows) > 0 {
+		content.Fields = rows[0]
+	} else {
+		for name, value := range merged {
+			if name == "fingerprint" || name == "source_tier" || name == "updated_at_ms" {
+				continue
+			}
+			content.Fields = append(content.Fields, canonicalField{name, value})
+		}
+	}
+	sort.Slice(content.Fields, func(i, j int) bool { return content.Fields[i].Name < content.Fields[j].Name })
+	for i := range content.Fields {
+		if value, ok := merged[content.Fields[i].Name]; ok {
+			content.Fields[i].Value = value
+		}
+	}
 	var children []struct{ name, query string }
 	switch kind {
 	case "threads":

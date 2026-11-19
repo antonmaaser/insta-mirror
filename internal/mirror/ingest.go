@@ -57,14 +57,14 @@ func (o sourceObject) fields(spec map[string]string) (map[string]any, error) {
 		}
 		if string(raw) == "null" {
 			switch column {
-			case "title", "image_url", "avatar_url", "nickname":
-				values[column] = ""
+			case "title", "image_url", "avatar_url", "nickname", "username", "full_name", "ai_agent_type", "body", "snippet", "bot_response_id", "tombstone_reason", "reply_to_message_id":
+				values[column] = nil
 			}
 			continue
 		}
 		var v any
 		switch column {
-		case "activity_at", "sent_at", "edited_at", "expires_at", "view_expires_at", "read_at", "input_mode", "latest_reel", "latest_besties_reel", "reel_seen_at":
+		case "activity_at_ms", "sent_at_ms", "edited_at_ms", "expires_at_ms", "view_expires_at_ms", "read_at_ms", "input_mode", "latest_reel_at", "latest_besties_at", "reel_seen_at":
 			n, err := strconv.ParseInt(o.id(key), 10, 64)
 			if string(raw) == "0" || string(raw) == `"0"` {
 				n, err = 0, nil
@@ -73,7 +73,7 @@ func (o sourceObject) fields(spec map[string]string) (map[string]any, error) {
 				return nil, fmt.Errorf("invalid source integer field %s", key)
 			}
 			v = n
-		case "verified", "restricted", "blocking", "following", "followed_by", "is_group", "muted", "pinned", "unread", "forwarded", "reported", "ai_generated", "admin", "member":
+		case "verified", "restricted", "blocking", "following", "followed_by", "is_group", "muted", "pinned", "unread", "forwarded", "reported", "ai_generated", "is_admin", "is_active":
 			var b bool
 			if json.Unmarshal(raw, &b) != nil {
 				return nil, fmt.Errorf("invalid source boolean field %s", key)
@@ -109,6 +109,17 @@ func addAlias(out []store.Alias, ns, scope, value string) []store.Alias {
 }
 
 type ingestion struct {
+	touchedMembers map[[2]int64]bool
+
+	nextID   map[string]int64
+	defaults map[string]map[string]any
+
+	entities     map[entityKey]*entityStage
+	seenEntities map[entityKey]map[string]bool
+	pageMessages map[string]json.RawMessage
+	processing   map[string]bool
+	tier         int
+
 	ctx          context.Context
 	tx           *sql.Tx
 	account      string
@@ -126,13 +137,16 @@ func (b *ingestion) resolve(kind string, aliases []store.Alias, primary string, 
 			break
 		}
 	}
-	id, created, bound, err := store.ResolveAliases(b.ctx, b.tx, b.account, kind, aliases, canonical, expected)
+	id, created, bound, err := store.ResolveAliases(b.ctx, b.tx, b.account, kind, aliases, canonical, expected, func() (int64, error) { return b.reserve(kind) })
 	if err != nil {
 		action := "deferred"
 		if errors.Is(err, store.ErrConflict) {
 			action = "conflict"
 		}
 		b.decisions = append(b.decisions, store.Decision{Kind: kind, ID: id, Action: action, Reason: err.Error()})
+	}
+	if err == nil {
+		_, err = b.entity(kind, id)
 	}
 	return id, created, bound, err
 }
@@ -151,7 +165,7 @@ func (b *ingestion) relationshipError(relationship string, id int64, err error) 
 func (b *ingestion) decision(kind string, id int64, created, bound bool, fields []string) {
 	action, reason := "unchanged", "values match"
 	if bound {
-		fields = append(fields, "source_ids")
+		fields = append(fields, "identities")
 	}
 	if len(fields) > 0 {
 		action, reason = "updated", ""
@@ -169,6 +183,9 @@ func (b *ingestion) ignored(kind string, id int64, fields []string) {
 }
 
 func (b *ingestion) unsupported(kind string, id int64, o sourceObject, spec map[string]string, consumed ...string) {
+	for _, key := range []string{"is_cannes", "is_predicted_cannes", "igd_wearables_attribution_text", "igd_wearables_attribution_type", "creator_broadcast_thread_data", "event_chat_info", "group_creator", "hidden_chat_info", "safety_mitigations", "is_tombstone_revealable", "msg_reactions", "ig_thread_capabilities", "pinned_messages_metadata"} {
+		delete(o, key)
+	}
 	keys := make(map[string]bool, len(consumed))
 	for _, key := range consumed {
 		keys[key] = true
@@ -185,12 +202,6 @@ func (b *ingestion) unsupported(kind string, id int64, o sourceObject, spec map[
 	}
 }
 
-func (b *ingestion) patch(kind string, id int64, values map[string]any, fill bool) ([]string, error) {
-	changed, ignored, err := store.Patch(b.ctx, b.tx, kind, "account_id=? AND id=?", []any{b.account, id}, values, fill)
-	b.ignored(kind, id, ignored)
-	return changed, err
-}
-
 func (b *ingestion) userRef(ns, id string) (int64, error) {
 	owner, created, bound, err := b.resolve("users", addAlias(nil, ns, "", id), "user.igid", 0)
 	if err == nil {
@@ -200,8 +211,8 @@ func (b *ingestion) userRef(ns, id string) (int64, error) {
 }
 
 var profileFields = map[string]string{
-	"username": "username", "full_name": "name", "profile_pic_url": "avatar_url", "is_verified": "verified",
-	"ai_agent_type": "ai_agent_type", "latest_reel_media": "latest_reel", "latest_besties_reel_media": "latest_besties_reel",
+	"username": "username", "full_name": "full_name", "profile_pic_url": "avatar_url", "is_verified": "verified",
+	"ai_agent_type": "ai_agent_type", "latest_reel_media": "latest_reel_at", "latest_besties_reel_media": "latest_besties_at",
 	"reel_media_seen_timestamp": "reel_seen_at",
 }
 
@@ -226,6 +237,9 @@ func (b *ingestion) user(raw json.RawMessage, igid, fbid, name string, fill bool
 	if err != nil {
 		return 0, err
 	}
+	if b.memo("users", id, o) {
+		return id, nil
+	}
 	values, err := o.fields(profileFields)
 	if err != nil {
 		return 0, err
@@ -247,7 +261,7 @@ func (b *ingestion) user(raw json.RawMessage, igid, fbid, name string, fill bool
 	}
 	fields, err := b.patch("users", id, values, fill)
 	if err == nil && name != "" {
-		more, e := b.patch("users", id, map[string]any{"name": name}, true)
+		more, e := b.patch("users", id, map[string]any{"full_name": name}, true)
 		fields = append(fields, more...)
 		err = e
 	}
@@ -257,7 +271,7 @@ func (b *ingestion) user(raw json.RawMessage, igid, fbid, name string, fill bool
 }
 
 var threadFields = map[string]string{
-	"thread_title": "title", "thread_image_url": "image_url", "system_folder": "folder", "last_activity_timestamp_ms": "activity_at",
+	"thread_title": "title", "thread_image_url": "image_url", "system_folder": "folder", "last_activity_timestamp_ms": "activity_at_ms",
 	"thread_subtype": "subtype", "is_group": "is_group", "is_muted": "muted", "is_pin": "pinned", "marked_as_unread": "unread",
 	"input_mode": "input_mode", "reachability_status": "reachability",
 }
@@ -279,6 +293,9 @@ func (b *ingestion) thread(raw json.RawMessage, expected int64, remote string, c
 	if err != nil {
 		return 0, err
 	}
+	if b.memo("threads", id, o) {
+		return id, nil
+	}
 	values, err := o.fields(threadFields)
 	if err != nil {
 		return 0, err
@@ -290,8 +307,15 @@ func (b *ingestion) thread(raw json.RawMessage, expected int64, remote string, c
 		}
 		values["folder"] = fallback["folder"]
 	}
+	if raw, ok := o["ig_thread_capabilities"]; ok && string(raw) != "null" {
+		var value any
+		if err = json.Unmarshal(raw, &value); err != nil {
+			return 0, err
+		}
+		values["capabilities"] = store.JSONValue(value)
+	}
 	var deleted sql.NullBool
-	if err = b.tx.QueryRowContext(b.ctx, "SELECT deleted FROM threads WHERE id=?", id).Scan(&deleted); err != nil {
+	if err = b.scan("threads", id, []string{"deleted"}, &deleted); err != nil {
 		return 0, err
 	}
 	if deleted.Bool {
@@ -304,66 +328,23 @@ func (b *ingestion) thread(raw json.RawMessage, expected int64, remote string, c
 		return 0, err
 	}
 	b.decision("threads", id, created, bound, fields)
+	if err = b.pinMetadata(id, o); err != nil {
+		return 0, err
+	}
 	b.unsupported("threads", id, o, threadFields, "id", "thread_fbid", "thread_id", "thread_key", "folder", "users", "usersWithoutViewer", "viewer", "viewer_id", "nicknames", "slide_read_receipts", "admin_user_ids", "slide_messages", "pinned_messages", "__typename")
 	if err = b.members(id, o, complete && !b.fill); err != nil {
 		return 0, err
-	}
-	if complete && !b.fill && len(o["pinned_messages"]) > 0 && string(o["pinned_messages"]) != "null" {
-		var items []json.RawMessage
-		if json.Unmarshal(o["pinned_messages"], &items) != nil {
-			return 0, errors.New("invalid pinned messages")
-		}
-		ids := map[int64]bool{}
-		for _, item := range items {
-			ref := sourceObject{"id": item}.id("id")
-			if node, e := decodeObject(item); e == nil {
-				ref = node.id("message_id")
-				if ref == "" {
-					ref = node.id("id")
-				}
-			}
-			msg, e := b.messageRef(ref, id)
-			if e != nil {
-				return 0, e
-			}
-			ids[msg] = true
-		}
-		rows, e := b.tx.QueryContext(b.ctx, "SELECT id FROM messages WHERE thread_id=? AND pinned=1", id)
-		if e != nil {
-			return 0, e
-		}
-		for rows.Next() {
-			var msg int64
-			if e = rows.Scan(&msg); e != nil {
-				rows.Close()
-				return 0, e
-			}
-			if _, ok := ids[msg]; !ok {
-				ids[msg] = false
-			}
-		}
-		e = rows.Err()
-		rows.Close()
-		if e != nil {
-			return 0, e
-		}
-		for msg, pinned := range ids {
-			value := int64(0)
-			if pinned {
-				value = 1
-			}
-			changed, e := b.patch("messages", msg, map[string]any{"pinned": value}, false)
-			if e != nil {
-				return 0, e
-			}
-			b.decision("messages", msg, false, false, changed)
-		}
 	}
 	return id, nil
 }
 
 func (b *ingestion) member(thread, user int64, values map[string]any, fill bool) error {
-	res, err := b.tx.ExecContext(b.ctx, "INSERT INTO thread_members(thread_id,user_id) VALUES(?,?) ON CONFLICT DO NOTHING", thread, user)
+	if b.touchedMembers == nil {
+		b.touchedMembers = map[[2]int64]bool{}
+	}
+	b.touchedMembers[[2]int64{thread, user}] = true
+
+	res, err := b.tx.ExecContext(b.ctx, "INSERT INTO thread_members(account_id,thread_id,user_id,fingerprint) VALUES(?,?,?,?) ON CONFLICT DO NOTHING", b.account, thread, user, make([]byte, 32))
 	if err != nil {
 		return err
 	}
@@ -371,7 +352,7 @@ func (b *ingestion) member(thread, user int64, values map[string]any, fill bool)
 	if err != nil {
 		return err
 	}
-	fields, ignored, err := store.Patch(b.ctx, b.tx, "thread_members", "thread_id=? AND user_id=?", []any{thread, user}, values, fill)
+	fields, ignored, err := store.Patch(b.ctx, b.tx, "thread_members", "account_id=? AND thread_id=? AND user_id=?", []any{b.account, thread, user}, values, fill)
 	b.ignored("thread_members", thread, ignored)
 	b.decision("thread_members", thread, n > 0, false, fields)
 	return err
@@ -399,14 +380,14 @@ func (b *ingestion) members(thread int64, o sourceObject, complete bool) error {
 				seen[id] = true
 			}
 			if key != "viewer" {
-				if err = b.member(thread, id, map[string]any{"member": int64(1)}, b.fill); err != nil {
+				if err = b.member(thread, id, map[string]any{"is_active": int64(1)}, b.fill); err != nil {
 					return err
 				}
 			}
 		}
 	}
 	if complete && len(o["users"]) > 0 && string(o["users"]) != "null" {
-		rows, err := b.tx.QueryContext(b.ctx, "SELECT user_id FROM thread_members WHERE thread_id=? AND member=1", thread)
+		rows, err := b.tx.QueryContext(b.ctx, "SELECT user_id FROM thread_members WHERE account_id=? AND thread_id=? AND is_active=1", b.account, thread)
 		if err != nil {
 			return err
 		}
@@ -427,7 +408,7 @@ func (b *ingestion) members(thread int64, o sourceObject, complete bool) error {
 			return err
 		}
 		for _, id := range removed {
-			if err = b.member(thread, id, map[string]any{"member": int64(0)}, false); err != nil {
+			if err = b.member(thread, id, map[string]any{"is_active": int64(0)}, false); err != nil {
 				return err
 			}
 		}
@@ -450,7 +431,7 @@ func (b *ingestion) members(thread int64, o sourceObject, complete bool) error {
 					return err
 				}
 				admins[id] = true
-				if err = b.member(thread, id, map[string]any{"admin": int64(1)}, b.fill); err != nil {
+				if err = b.member(thread, id, map[string]any{"is_admin": int64(1)}, b.fill); err != nil {
 					return err
 				}
 			case "nicknames":
@@ -485,7 +466,7 @@ func (b *ingestion) members(thread int64, o sourceObject, complete bool) error {
 }
 
 func (b *ingestion) clearAdmins(thread int64, admins map[int64]bool) error {
-	rows, err := b.tx.QueryContext(b.ctx, "SELECT user_id FROM thread_members WHERE thread_id=? AND admin=1", thread)
+	rows, err := b.tx.QueryContext(b.ctx, "SELECT user_id FROM thread_members WHERE account_id=? AND thread_id=? AND is_admin=1", b.account, thread)
 	if err != nil {
 		return err
 	}
@@ -506,7 +487,7 @@ func (b *ingestion) clearAdmins(thread int64, admins map[int64]bool) error {
 		return err
 	}
 	for _, id := range removed {
-		if err = b.member(thread, id, map[string]any{"admin": int64(0)}, false); err != nil {
+		if err = b.member(thread, id, map[string]any{"is_admin": int64(0)}, false); err != nil {
 			return err
 		}
 	}
@@ -522,13 +503,13 @@ func (b *ingestion) receipt(thread int64, raw json.RawMessage) error {
 	if err != nil {
 		return err
 	}
-	values, err := o.fields(map[string]string{"watermark_timestamp_ms": "read_at"})
+	values, err := o.fields(map[string]string{"watermark_timestamp_ms": "read_at_ms"})
 	if err != nil {
 		return err
 	}
-	if at, ok := values["read_at"].(int64); ok {
+	if at, ok := values["read_at_ms"].(int64); ok {
 		var current sql.NullInt64
-		err = b.tx.QueryRowContext(b.ctx, "SELECT read_at FROM thread_members WHERE thread_id=? AND user_id=?", thread, user).Scan(&current)
+		err = b.tx.QueryRowContext(b.ctx, "SELECT read_at_ms FROM thread_members WHERE account_id=? AND thread_id=? AND user_id=?", b.account, thread, user).Scan(&current)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return err
 		}
@@ -578,12 +559,18 @@ func (b *ingestion) sender(o sourceObject, fill bool) (int64, error) {
 const reactionNoticeKind = "REACTION_ACTION_LOG"
 
 var messageFields = map[string]string{
-	"timestamp_ms": "sent_at", "text_body": "body", "content_type": "kind", "igd_snippet": "snippet",
-	"expiration_timestamp_ms": "expires_at", "view_expiration_timestamp_ms": "view_expires_at",
+	"timestamp_ms": "sent_at_ms", "text_body": "body", "content_type": "kind", "igd_snippet": "snippet",
+	"expiration_timestamp_ms": "expires_at_ms", "view_expiration_timestamp_ms": "view_expires_at_ms",
+	"bot_response_id": "bot_response_id", "tombstone_reason": "tombstone_reason",
 	"igd_is_forwarded": "forwarded", "is_pinned": "pinned", "is_reported": "reported", "is_ai_generated": "ai_generated",
 }
 
 func (b *ingestion) messageRef(remote string, thread int64) (int64, error) {
+	if raw, ok := b.pageMessages[remote]; ok && !b.processing[remote] {
+		delete(b.pageMessages, remote)
+		return b.message(raw, thread, false)
+	}
+
 	id, created, bound, err := b.resolve("messages", addAlias(nil, "message.mid", "", remote), "message.mid", 0)
 	if err != nil {
 		return 0, err
@@ -598,13 +585,13 @@ func (b *ingestion) messageThread(id, thread int64) ([]string, error) {
 		return nil, nil
 	}
 	var current sql.NullInt64
-	if err := b.tx.QueryRowContext(b.ctx, "SELECT thread_id FROM messages WHERE id=?", id).Scan(&current); err != nil {
+	if err := b.scan("messages", id, []string{"thread_id"}, &current); err != nil {
 		return nil, err
 	}
 	if current.Valid && current.Int64 != thread {
 		return nil, store.ErrConflict
 	}
-	return b.patch("messages", id, map[string]any{"thread_id": thread}, true)
+	return b.patchTier("messages", id, map[string]any{"thread_id": thread}, true, 1)
 }
 
 func (b *ingestion) message(raw json.RawMessage, thread int64, quote bool) (int64, error) {
@@ -612,11 +599,32 @@ func (b *ingestion) message(raw json.RawMessage, thread int64, quote bool) (int6
 	if err != nil {
 		return 0, err
 	}
+	if raw, ok := o["msg_reactions"]; ok {
+		o["reactions"] = raw
+	}
+	ref := o.id("message_id")
+	if ref == "" {
+		ref = o.id("id")
+	}
+	if b.processing == nil {
+		b.processing = map[string]bool{}
+	}
+	b.processing[ref] = true
+	defer delete(b.processing, ref)
+	delete(b.pageMessages, ref)
+	oldTier := b.tier
+	if quote {
+		b.tier = 1
+	}
+	defer func() { b.tier = oldTier }()
 	aliases := addAlias(nil, "message.mid", "", o.id("id"))
 	aliases = addAlias(aliases, "message.mid", "", o.id("message_id"))
 	id, created, bound, err := b.resolve("messages", aliases, "message.mid", 0)
 	if err != nil {
 		return 0, err
+	}
+	if b.memo("messages", id, o) {
+		return id, nil
 	}
 	if ref := o.id("thread_fbid"); ref != "" {
 		resolved, created, bound, err := b.resolve("threads", addAlias(nil, "thread.fbid", "", ref), "thread.fbid", thread)
@@ -631,10 +639,10 @@ func (b *ingestion) message(raw json.RawMessage, thread int64, quote bool) (int6
 		return 0, b.relationshipError("message thread", id, err)
 	}
 	fill := b.fill || quote
-	var deleted, placeholder int64
+	var deleted, is_placeholder int64
 	var edited sql.NullInt64
 	var storedKind sql.NullString
-	if err = b.tx.QueryRowContext(b.ctx, "SELECT coalesce(deleted,0),placeholder,edited_at,kind FROM messages WHERE id=?", id).Scan(&deleted, &placeholder, &edited, &storedKind); err != nil {
+	if err = b.scan("messages", id, []string{"deleted", "is_placeholder", "edited_at_ms", "kind"}, &deleted, &is_placeholder, &edited, &storedKind); err != nil {
 		return 0, err
 	}
 	if deleted != 0 {
@@ -645,7 +653,7 @@ func (b *ingestion) message(raw json.RawMessage, thread int64, quote bool) (int6
 		// Preserve the local ID for pagination and reaction references. This
 		// source notice never establishes the target or the reaction value.
 		more, err := b.patch("messages", id, map[string]any{
-			"kind": reactionNoticeKind, "placeholder": int64(1), "body": nil, "snippet": nil,
+			"kind": reactionNoticeKind, "is_placeholder": int64(1), "body": nil, "snippet": nil,
 		}, false)
 		if err != nil {
 			return 0, err
@@ -686,7 +694,7 @@ func (b *ingestion) message(raw json.RawMessage, thread int64, quote bool) (int6
 			if reply == id {
 				return 0, b.relationshipError("reply target", id, store.ErrConflict)
 			}
-			values["reply_id"] = reply
+			values["reply_to_message_id"] = reply
 		}
 	}
 	if content := o["content"]; len(content) > 0 {
@@ -728,12 +736,12 @@ func (b *ingestion) message(raw json.RawMessage, thread int64, quote bool) (int6
 		}
 		values["edits"] = store.JSONValue(edits)
 		if sourceEdit > 0 {
-			values["edited_at"] = sourceEdit
+			values["edited_at_ms"] = sourceEdit
 		}
 	}
 	if edited.Valid && (fill || sourceEdit < edited.Int64) {
 		var ignored []string
-		for _, key := range []string{"body", "snippet", "edits", "edited_at"} {
+		for _, key := range []string{"body", "snippet", "edits", "edited_at_ms"} {
 			if _, present := values[key]; present {
 				ignored = append(ignored, key)
 			}
@@ -741,10 +749,10 @@ func (b *ingestion) message(raw json.RawMessage, thread int64, quote bool) (int6
 		}
 		b.ignored("messages", id, ignored)
 	}
-	if fill && !quote && placeholder != 0 {
+	if fill && !quote && is_placeholder != 0 {
 		// A full acquisition can replace text previously acquired as a quote.
 		full := map[string]any{}
-		for _, key := range []string{"body", "snippet", "kind", "sent_at", "attachments"} {
+		for _, key := range []string{"body", "snippet", "kind", "sent_at_ms", "attachments"} {
 			if v, ok := values[key]; ok && v != nil {
 				full[key] = v
 				delete(values, key)
@@ -761,22 +769,12 @@ func (b *ingestion) message(raw json.RawMessage, thread int64, quote bool) (int6
 		return 0, err
 	}
 	fields = append(fields, more...)
-	if !quote && placeholder != 0 && thread != 0 && o.id("timestamp_ms") != "" {
-		more, err = b.patch("messages", id, map[string]any{"placeholder": int64(0)}, false)
+	if !quote && is_placeholder != 0 && thread != 0 && o.id("timestamp_ms") != "" {
+		more, err = b.patch("messages", id, map[string]any{"is_placeholder": int64(0)}, false)
 		if err != nil {
 			return 0, err
 		}
 		fields = append(fields, more...)
-	}
-	for _, key := range fields {
-		if key == "attachments" {
-			if _, err := b.tx.ExecContext(b.ctx, `DELETE FROM media_cache WHERE account_id=? AND message_id=? AND NOT EXISTS(
- SELECT 1 FROM json_each((SELECT attachments FROM messages WHERE id=?)) a
- WHERE a.value->>'key'=media_cache.attachment AND coalesce(a.value->>'restricted',0)=(media_cache.status='restricted'))`, b.account, id, id); err != nil {
-				return 0, err
-			}
-			break
-		}
 	}
 	b.decision("messages", id, created, bound, fields)
 	b.unsupported("messages", id, o, messageFields, "id", "message_id", "thread_fbid", "sender_fbid", "sender", "replied_to_message_id", "replied_to_message", "content", "slide_edit_history", "reactions", "mentions", "offline_threading_id", "__typename")
@@ -824,11 +822,11 @@ func (b *ingestion) messageRelations(id, thread int64, o sourceObject, fill bool
 		if len(raw) == 0 || string(raw) == "null" {
 			continue
 		}
-		var known sql.NullInt64
-		if err := b.tx.QueryRowContext(b.ctx, "SELECT "+key+"_known FROM messages WHERE id=?", id).Scan(&known); err != nil {
+		local, err := b.entity("messages", id)
+		if err != nil {
 			return err
 		}
-		if fill && known.Valid {
+		if fill || b.incomingTier() < local.tier {
 			b.ignored("messages", id, []string{key})
 			continue
 		}
@@ -851,7 +849,7 @@ func (b *ingestion) messageRelations(id, thread int64, o sourceObject, fill bool
 				// provides no complete list or evidence of removals.
 				continue
 			}
-			rows, err := b.tx.QueryContext(b.ctx, "SELECT user_id FROM message_reactions WHERE message_id=?", id)
+			rows, err := b.tx.QueryContext(b.ctx, "SELECT user_id FROM message_reactions WHERE account_id=? AND message_id=?", b.account, id)
 			if err != nil {
 				return err
 			}
@@ -872,7 +870,7 @@ func (b *ingestion) messageRelations(id, thread int64, o sourceObject, fill bool
 				return err
 			}
 			for _, user := range removed {
-				if _, err = b.tx.ExecContext(b.ctx, "DELETE FROM message_reactions WHERE message_id=? AND user_id=?", id, user); err != nil {
+				if _, err = b.tx.ExecContext(b.ctx, "DELETE FROM message_reactions WHERE account_id=? AND message_id=? AND user_id=?", b.account, id, user); err != nil {
 					return err
 				}
 				b.decision("message_reactions", id, false, false, []string{"removed"})
@@ -908,7 +906,7 @@ func (b *ingestion) messageRelations(id, thread int64, o sourceObject, fill bool
 				}
 				k := mentionKey{m.Offset, m.Length, string(m.ProfileRangeType)}
 				seen[k] = true
-				res, err := b.tx.ExecContext(b.ctx, `INSERT INTO message_mentions VALUES(?,?,?,?,?,?) ON CONFLICT(message_id,offset,length,kind) DO UPDATE SET user_id=excluded.user_id,thread_id=excluded.thread_id WHERE user_id IS NOT excluded.user_id OR thread_id IS NOT excluded.thread_id`, id, k.offset, k.length, k.kind, user, target)
+				res, err := b.tx.ExecContext(b.ctx, `INSERT INTO message_mentions VALUES(?,?,?,?,?,?,?) ON CONFLICT(account_id,message_id,offset,length,kind) DO UPDATE SET mentioned_user_id=excluded.mentioned_user_id,mentioned_thread_id=excluded.mentioned_thread_id WHERE mentioned_user_id IS NOT excluded.mentioned_user_id OR mentioned_thread_id IS NOT excluded.mentioned_thread_id`, b.account, id, k.offset, k.length, k.kind, user, target)
 				if err != nil {
 					return err
 				}
@@ -922,7 +920,7 @@ func (b *ingestion) messageRelations(id, thread int64, o sourceObject, fill bool
 				}
 				b.decision("message_mentions", id, false, false, fields)
 			}
-			rows, err := b.tx.QueryContext(b.ctx, "SELECT offset,length,kind FROM message_mentions WHERE message_id=?", id)
+			rows, err := b.tx.QueryContext(b.ctx, "SELECT offset,length,kind FROM message_mentions WHERE account_id=? AND message_id=?", b.account, id)
 			if err != nil {
 				return err
 			}
@@ -943,14 +941,11 @@ func (b *ingestion) messageRelations(id, thread int64, o sourceObject, fill bool
 				return err
 			}
 			for _, k := range removed {
-				if _, err = b.tx.ExecContext(b.ctx, "DELETE FROM message_mentions WHERE message_id=? AND offset=? AND length=? AND kind=?", id, k.offset, k.length, k.kind); err != nil {
+				if _, err = b.tx.ExecContext(b.ctx, "DELETE FROM message_mentions WHERE account_id=? AND message_id=? AND offset=? AND length=? AND kind=?", b.account, id, k.offset, k.length, k.kind); err != nil {
 					return err
 				}
 				b.decision("message_mentions", id, false, false, []string{"removed"})
 			}
-		}
-		if _, err := b.patch("messages", id, map[string]any{key + "_known": int64(1)}, false); err != nil {
-			return err
 		}
 	}
 	return nil
@@ -966,7 +961,7 @@ func (b *ingestion) reaction(msg, thread int64, raw json.RawMessage, remove bool
 		return 0, b.relationshipError("reaction actor", msg, err)
 	}
 	var exists bool
-	if err = b.tx.QueryRowContext(b.ctx, "SELECT EXISTS(SELECT 1 FROM message_reactions WHERE message_id=? AND user_id=?)", msg, user).Scan(&exists); err != nil {
+	if err = b.tx.QueryRowContext(b.ctx, "SELECT EXISTS(SELECT 1 FROM message_reactions WHERE account_id=? AND message_id=? AND user_id=?)", b.account, msg, user).Scan(&exists); err != nil {
 		return 0, err
 	}
 	if b.inboxPreview && exists {
@@ -975,13 +970,13 @@ func (b *ingestion) reaction(msg, thread int64, raw json.RawMessage, remove bool
 	}
 	var result sql.Result
 	if remove {
-		result, err = b.tx.ExecContext(b.ctx, "DELETE FROM message_reactions WHERE message_id=? AND user_id=?", msg, user)
+		result, err = b.tx.ExecContext(b.ctx, "DELETE FROM message_reactions WHERE account_id=? AND message_id=? AND user_id=?", b.account, msg, user)
 	} else {
 		value := o.id("reaction")
 		if value == "" {
 			return 0, errors.New("missing reaction")
 		}
-		values, err := o.fields(map[string]string{"reaction_timestamp_ms": "read_at"})
+		values, err := o.fields(map[string]string{"reaction_timestamp_ms": "read_at_ms"})
 		if err != nil {
 			return 0, err
 		}
@@ -993,7 +988,7 @@ func (b *ingestion) reaction(msg, thread int64, raw json.RawMessage, remove bool
 			}
 			log = id
 		}
-		result, err = b.tx.ExecContext(b.ctx, `INSERT INTO message_reactions VALUES(?,?,?,?,?) ON CONFLICT(message_id,user_id) DO UPDATE SET reaction=excluded.reaction,reacted_at=excluded.reacted_at,log_message_id=excluded.log_message_id WHERE reaction IS NOT excluded.reaction OR reacted_at IS NOT excluded.reacted_at OR log_message_id IS NOT excluded.log_message_id`, msg, user, value, values["read_at"], log)
+		result, err = b.tx.ExecContext(b.ctx, `INSERT INTO message_reactions VALUES(?,?,?,?,?,?) ON CONFLICT(account_id,message_id,user_id) DO UPDATE SET reaction=excluded.reaction,reacted_at_ms=excluded.reacted_at_ms,log_message_id=excluded.log_message_id WHERE reaction IS NOT excluded.reaction OR reacted_at_ms IS NOT excluded.reacted_at_ms OR log_message_id IS NOT excluded.log_message_id`, b.account, msg, user, value, values["read_at_ms"], log)
 		if err != nil {
 			return 0, err
 		}
@@ -1010,9 +1005,6 @@ func (b *ingestion) reaction(msg, thread int64, raw json.RawMessage, remove bool
 		changed = []string{"reaction"}
 	}
 	b.decision("message_reactions", msg, !exists && !remove, false, changed)
-	if b.event > 0 {
-		_, err = b.patch("messages", msg, map[string]any{"reactions_known": int64(1)}, false)
-	}
 	return user, err
 }
 
@@ -1047,7 +1039,7 @@ func (b *ingestion) delta(raw json.RawMessage, delta slidetypes.Delta) error {
 		return err
 	}
 	var deleted sql.NullBool
-	if err = b.tx.QueryRowContext(b.ctx, "SELECT deleted FROM threads WHERE id=?", thread).Scan(&deleted); err != nil {
+	if err = b.scan("threads", thread, []string{"deleted"}, &deleted); err != nil {
 		return err
 	}
 	if deleted.Bool {
@@ -1084,7 +1076,7 @@ func (b *ingestion) delta(raw json.RawMessage, delta slidetypes.Delta) error {
 		return err
 	}
 	if message != 0 {
-		if err = b.tx.QueryRowContext(b.ctx, "SELECT deleted FROM messages WHERE id=?", message).Scan(&deleted); err != nil {
+		if err = b.scan("messages", message, []string{"deleted"}, &deleted); err != nil {
 			return err
 		}
 		if deleted.Bool {
@@ -1107,9 +1099,9 @@ func (b *ingestion) delta(raw json.RawMessage, delta slidetypes.Delta) error {
 		if d.ReadTimestampMS.IsZero() {
 			return errors.New("read event has no timestamp")
 		}
-		values := map[string]any{"read_at": d.ReadTimestampMS.UnixMilli(), "unread": int64(0)}
+		values := map[string]any{"read_at_ms": d.ReadTimestampMS.UnixMilli(), "unread": int64(0)}
 		var prior sql.NullInt64
-		if err = b.tx.QueryRowContext(b.ctx, "SELECT read_at FROM threads WHERE id=?", thread).Scan(&prior); err != nil {
+		if err = b.scan("threads", thread, []string{"read_at_ms"}, &prior); err != nil {
 			return err
 		}
 		if prior.Valid && prior.Int64 > d.ReadTimestampMS.UnixMilli() {
@@ -1136,22 +1128,27 @@ func (b *ingestion) delta(raw json.RawMessage, delta slidetypes.Delta) error {
 		}
 		at := d.SlideEditHistoryEntry.TimestampMS.UnixMilli()
 		var previous sql.NullInt64
-		var history sql.NullString
-		if err = b.tx.QueryRowContext(b.ctx, "SELECT edited_at,edits FROM messages WHERE id=?", message).Scan(&previous, &history); err != nil {
+		var history []store.Edit
+		if err = b.scan("messages", message, []string{"edited_at_ms"}, &previous); err != nil {
 			return err
 		}
 		if previous.Valid && previous.Int64 > at {
 			b.decision("messages", message, false, false, nil)
 			return nil
 		}
-		values["edited_at"] = at
-		if text, ok := values["body"].(string); ok {
-			edits := []store.Edit{}
-			if history.Valid {
-				if err = json.Unmarshal([]byte(history.String), &edits); err != nil {
-					return err
-				}
+		history, err = b.edits(message)
+		if err != nil {
+			return err
+		}
+		values["edited_at_ms"] = at
+		if _, ok := values["body"].(string); ok {
+			staged, e := b.entity("messages", message)
+			if e != nil {
+				return e
 			}
+			text, _ := staged.values["body"].(string)
+			edits := []store.Edit{}
+			edits = append(edits, history...)
 			if len(edits) == 0 || edits[len(edits)-1] != (store.Edit{Body: text, At: at}) {
 				edits = append(edits, store.Edit{Body: text, At: at})
 				values["edits"] = store.JSONValue(edits)
@@ -1162,7 +1159,7 @@ func (b *ingestion) delta(raw json.RawMessage, delta slidetypes.Delta) error {
 		if err := messagePatch(map[string]any{"deleted": int64(1), "body": nil, "snippet": nil, "attachments": nil, "edits": nil}); err != nil {
 			return err
 		}
-		_, err := b.tx.ExecContext(b.ctx, "DELETE FROM media_cache WHERE account_id=? AND message_id=?", b.account, message)
+		_, err := b.tx.ExecContext(b.ctx, "DELETE FROM message_attachments WHERE account_id=? AND message_id=?", b.account, message)
 		return err
 	case *slidetypes.DeleteThreadEvent:
 		changed, err := b.patch("threads", thread, map[string]any{"deleted": int64(1)}, false)
@@ -1193,6 +1190,14 @@ func (b *ingestion) delta(raw json.RawMessage, delta slidetypes.Delta) error {
 				if err != nil {
 					return err
 				}
+				if value == 0 {
+					_, err = b.tx.ExecContext(b.ctx, `DELETE FROM thread_pinned_messages WHERE account_id=? AND thread_id=? AND message_id=?`, b.account, thread, message)
+				} else {
+					_, err = b.tx.ExecContext(b.ctx, `INSERT INTO thread_pinned_messages VALUES(?,?,?) ON CONFLICT DO NOTHING`, b.account, thread, message)
+				}
+				if err != nil {
+					return err
+				}
 				if err = messagePatch(map[string]any{"pinned": int64(value)}); err != nil {
 					return err
 				}
@@ -1207,10 +1212,10 @@ func (b *ingestion) delta(raw json.RawMessage, delta slidetypes.Delta) error {
 		if err != nil {
 			return err
 		}
-		return b.member(thread, user, map[string]any{"member": int64(0)}, false)
+		return b.member(thread, user, map[string]any{"is_active": int64(0)}, false)
 	case *slidetypes.AdminChangeEvent:
 		if len(o["admin_igids"]) == 0 || string(o["admin_igids"]) == "null" {
-			return errors.New("admin event has no list")
+			return errors.New("is_admin event has no list")
 		}
 		admins := map[int64]bool{}
 		for _, remote := range d.AdminIGIDs {
@@ -1219,7 +1224,7 @@ func (b *ingestion) delta(raw json.RawMessage, delta slidetypes.Delta) error {
 				return err
 			}
 			admins[user] = true
-			if err = b.member(thread, user, map[string]any{"admin": int64(1)}, false); err != nil {
+			if err = b.member(thread, user, map[string]any{"is_admin": int64(1)}, false); err != nil {
 				return err
 			}
 		}

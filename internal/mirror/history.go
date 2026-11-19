@@ -1,6 +1,7 @@
 package mirror
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -92,7 +93,33 @@ func (e *Engine) applyPage(ctx context.Context, raw []byte, spec pageSpec) error
 	default:
 		return errors.New("source page has no explicit pagination boundary")
 	}
+	var pageValue any
+	decoder := json.NewDecoder(bytes.NewReader(container))
+	decoder.UseNumber()
+	if err := decoder.Decode(&pageValue); err != nil {
+		return err
+	}
+	pageHash := store.Hash([]byte(store.JSONValue(pageValue)))
 	return e.ingestTransaction(ctx, spec.Scope+":"+spec.ID, func(b *ingestion) error {
+		b.tier = 4
+		b.pageMessages = map[string]json.RawMessage{}
+		b.processing = map[string]bool{}
+		if spec.Messages {
+			for _, edge := range page.Edges {
+				node, err := decodeObject(edge.Node)
+				if err != nil {
+					return err
+				}
+				ref := node.id("message_id")
+				if ref == "" {
+					ref = node.id("id")
+				}
+				if ref != "" {
+					b.pageMessages[ref] = edge.Node
+				}
+			}
+		}
+
 		tx := b.tx
 		var prior, realtime store.State
 		if err := store.ReadState(ctx, tx, e.Account, spec.Scope, spec.ID, &prior); err != nil {
@@ -106,6 +133,19 @@ func (e *Engine) applyPage(ctx context.Context, raw []byte, spec pageSpec) error
 		}
 		b.fill = spec.Scope == "thread" || spec.Messages && !spec.Start || realtime.Revision != spec.RealtimeRevision
 		now := time.Now().UnixMilli()
+		// No reliable item version token exists in the current upstream types. Hash the
+		// complete parent/page content, and skip only a repeated terminal head page.
+		if spec.Messages && spec.Start && !spec.Preserve && prior.Complete && !page.Info.HasNextPage && prior.PageHash == pageHash && realtime.Revision == spec.RealtimeRevision {
+			pending, err := b.pendingThreadMedia(spec.ID)
+			if err != nil {
+				return err
+			}
+			if !pending {
+				prior.LastSuccess = now
+				return store.SaveState(ctx, tx, e.Account, spec.Scope, spec.ID, prior)
+			}
+		}
+
 		state := store.State{Cursor: page.Info.EndCursor, Complete: !page.Info.HasNextPage, LastSuccess: now, Revision: prior.Revision + 1, Generation: prior.Generation}
 		var ids []int64
 		if spec.Messages {
@@ -118,7 +158,7 @@ func (e *Engine) applyPage(ctx context.Context, raw []byte, spec pageSpec) error
 				return err
 			}
 			var deleted sql.NullBool
-			if err = tx.QueryRowContext(ctx, "SELECT deleted FROM threads WHERE id=?", thread).Scan(&deleted); err != nil {
+			if err = b.scan("threads", thread, []string{"deleted"}, &deleted); err != nil {
 				return err
 			}
 			if deleted.Bool {
@@ -174,7 +214,7 @@ func (e *Engine) applyPage(ctx context.Context, raw []byte, spec pageSpec) error
 				state.Target, state.Candidate = "", ""
 			}
 		}
-		state.PageHash = store.Hash([]byte(store.JSONValue(ids)))
+		state.PageHash = pageHash
 		if !spec.Preserve && !state.Complete && (state.Cursor == "" || state.Cursor == spec.Previous || prior.PageHash == state.PageHash) {
 			return errors.New("pagination did not advance")
 		}
@@ -228,6 +268,9 @@ func (e *Engine) applyPage(ctx context.Context, raw []byte, spec pageSpec) error
 }
 
 func (b *ingestion) inboxThread(raw json.RawMessage, pinned bool) (int64, error) {
+	oldTier := b.tier
+	b.tier = 2
+	defer func() { b.tier = oldTier }()
 	wrapper, err := decodeObject(raw)
 	if err != nil {
 		return 0, err
@@ -237,7 +280,7 @@ func (b *ingestion) inboxThread(raw json.RawMessage, pinned bool) (int64, error)
 		return 0, err
 	}
 	var deleted sql.NullBool
-	if err = b.tx.QueryRowContext(b.ctx, "SELECT deleted FROM threads WHERE id=?", thread).Scan(&deleted); err != nil {
+	if err = b.scan("threads", thread, []string{"deleted"}, &deleted); err != nil {
 		return 0, err
 	}
 	if deleted.Bool {
@@ -250,9 +293,9 @@ func (b *ingestion) inboxThread(raw json.RawMessage, pinned bool) (int64, error)
 		}
 		b.decision("threads", thread, false, false, fields)
 	}
-	priorFill, priorPreview := b.fill, b.inboxPreview
-	b.fill, b.inboxPreview = true, true
-	defer func() { b.fill, b.inboxPreview = priorFill, priorPreview }()
+	priorFill, priorPreview, priorTier := b.fill, b.inboxPreview, b.tier
+	b.fill, b.inboxPreview, b.tier = true, true, 2
+	defer func() { b.fill, b.inboxPreview, b.tier = priorFill, priorPreview, priorTier }()
 	if rawMessages := field(raw, "as_ig_direct_thread", "slide_messages", "edges"); object(rawMessages) {
 		var edges []struct {
 			Node json.RawMessage `json:"node"`
@@ -374,7 +417,7 @@ func (e *Engine) Initialize(ctx context.Context) error {
 		}
 		values := map[string]any{}
 		for field, value := range map[string]string{
-			"name": viewer.GetName(), "username": viewer.GetUsername(), "avatar_url": viewer.GetAvatarURL(),
+			"full_name": viewer.GetName(), "username": viewer.GetUsername(), "avatar_url": viewer.GetAvatarURL(),
 		} {
 			if value != "" {
 				values[field] = value
@@ -384,6 +427,9 @@ func (e *Engine) Initialize(ctx context.Context) error {
 			id, created, bound, err := b.resolve("users", aliases, "user.igid", 0)
 			if err != nil {
 				return b.relationshipError("owner identity", id, err)
+			}
+			if _, err = b.tx.ExecContext(ctx, `UPDATE accounts SET self_user_id=?,updated_at_ms=? WHERE account_id=?`, id, time.Now().UnixMilli(), e.Account); err != nil {
+				return err
 			}
 			fields, err := b.patch("users", id, values, false)
 			if err != nil {
@@ -447,7 +493,7 @@ func (e *Engine) History(ctx context.Context) error {
 			folderErrors = append(folderErrors, folder+": source availability boundaries retained; see folder state")
 		}
 	}
-	rows, err := e.DB.DB.QueryContext(ctx, `SELECT t.id, i.remote_id FROM threads t JOIN source_ids i ON i.account_id=t.account_id AND i.thread_id=t.id AND i.namespace='thread.fbid' WHERE t.account_id=? AND coalesce(t.deleted,0)=0 ORDER BY t.id`, e.Account)
+	rows, err := e.DB.DB.QueryContext(ctx, `SELECT t.thread_id, i.remote_id FROM threads t JOIN thread_identities i ON i.account_id=t.account_id AND i.thread_id=t.thread_id AND i.namespace='fbid' WHERE t.account_id=? AND coalesce(t.deleted,0)=0 ORDER BY t.thread_id`, e.Account)
 	if err != nil {
 		return err
 	}
@@ -484,7 +530,7 @@ func (e *Engine) History(ctx context.Context) error {
 	}
 	state := store.State{Complete: failures == 0 && len(folderErrors) == 0, LastSuccess: previous.LastSuccess, Gaps: folderErrors}
 	var unresolved int
-	if err = e.DB.DB.QueryRowContext(ctx, `SELECT count(*) FROM threads t WHERE t.account_id=? AND coalesce(t.deleted,0)=0 AND NOT EXISTS(SELECT 1 FROM source_ids i WHERE i.account_id=t.account_id AND i.thread_id=t.id AND i.namespace='thread.fbid')`, e.Account).Scan(&unresolved); err != nil {
+	if err = e.DB.DB.QueryRowContext(ctx, `SELECT count(*) FROM threads t WHERE t.account_id=? AND coalesce(t.deleted,0)=0 AND NOT EXISTS(SELECT 1 FROM thread_identities i WHERE i.account_id=t.account_id AND i.thread_id=t.thread_id AND i.namespace='fbid')`, e.Account).Scan(&unresolved); err != nil {
 		return err
 	}
 	if unresolved > 0 {
